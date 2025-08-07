@@ -22,8 +22,8 @@ from internal.scraper.scraper import scrape_user_agents
 
 logger = logging.getLogger(__name__)
 
-# Configuración de límites de mensaje gRPC (50MB)
-MAX_MESSAGE_SIZE = 50 * 1024 * 1024
+# Configuración de límites de mensaje gRPC (250MB)
+MAX_MESSAGE_SIZE = 250 * 1024 * 1024
 GRPC_OPTIONS = [
     ('grpc.max_send_message_length', MAX_MESSAGE_SIZE),
     ('grpc.max_receive_message_length', MAX_MESSAGE_SIZE),
