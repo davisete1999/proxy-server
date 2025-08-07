@@ -1,35 +1,41 @@
-# Usa una imagen de Go como base
-FROM golang AS builder
+## Dockerfile
+FROM python:3.11-slim
 
-# Configura las variables de entorno
-ENV GO111MODULE=on \
-    CGO_ENABLED=0 \
-    GOOS=linux \
-    GOARCH=amd64
+# Instalar dependencias del sistema
+RUN apt-get update && apt-get install -y \
+    wget \
+    gnupg \
+    unzip \
+    curl \
+    xvfb \
+    && rm -rf /var/lib/apt/lists/*
 
-# Crea un directorio de trabajo dentro del contenedor
-WORKDIR /build
+# Instalar Chrome
+RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
+    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list \
+    && apt-get update \
+    && apt-get install -y google-chrome-stable \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copia los archivos del proyecto al directorio de trabajo
-COPY . .
-
-# Compila la aplicación
-RUN go build -o main ./cmd/main.go
-
-# Empieza a construir la imagen final
-FROM alpine:latest
-
-# Instala las dependencias necesarias
-RUN apk --no-cache add ca-certificates
-
-# Copia el binario compilado desde la etapa anterior
-COPY --from=builder /build/main /app/main
-
-# Establece el directorio de trabajo
+# Establecer directorio de trabajo
 WORKDIR /app
 
-# Expone el puerto en el que la aplicación escucha
+# Copiar requirements y instalar dependencias Python
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copiar el código fuente
+COPY . .
+
+# Generar archivos proto
+RUN python -m grpc_tools.protoc \
+    --proto_path=protos \
+    --python_out=. \
+    --grpc_python_out=. \
+    protos/proxy.proto
+
+# Exponer puerto
 EXPOSE 5000
 
-# Ejecuta la aplicación cuando el contenedor se inicia
-CMD ["./main"]
+# Comando de inicio
+CMD ["python", "main.py"]

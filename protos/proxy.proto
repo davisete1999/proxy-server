@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package proxy;
+
+service ProxyService {
+    rpc FetchContent(Request) returns (Response);
+    rpc GetRandomProxy(ProxyRequest) returns (ProxyResponse);
+    rpc GetProxyStats(StatsRequest) returns (StatsResponse);
+}
+
+message Request {
+    string url = 1;
+    string session = 2;
+    bool proxy = 3;
+    bool redirect = 4;
+}
+
+message Response {
+    bytes content = 1;
+}
+
+message ProxyRequest {
+    string session = 1;
+}
+
+message ProxyResponse {
+    string proxy = 1;
+    bool success = 2;
+    string message = 3;
+}
+
+message StatsRequest {
+    // Vacío por ahora
+}
+
+message StatsResponse {
+    map<string, int32> proxy_count_by_session = 1;
+    int32 total_valid_proxies = 2;
+}

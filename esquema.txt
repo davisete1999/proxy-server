@@ -1,410 +1,343 @@
 === Estructura de directorios y archivos ===
+├── proxy_pb2.py
+├── main.py
 ├── Dockerfile
 ├── README.md
-├── go.mod
+├── scripts
+│   ├── generate_proto.sh
+├── proxy_pb2_grpc.py
 ├── api
-│   ├── server.go
+│   ├── server.py
 ├── docker-compose.yml
 ├── script.sh
-├── fix.sh
-├── go.sum
-├── generateProxyProto.sh
 ├── internal
+│   ├── __init__.py
 │   ├── proxy
-│   │   ├── proxy.go
+│   │   ├── __init__.py
+│   │   ├── proxy.py
 │   ├── scraper
-│   │   ├── scraper.go
+│   │   ├── scraper.py
 │   ├── config
-│   │   ├── config.go
-│   │   ├── sessions.go
-├── cmd
-│   ├── main.go
+│   │   ├── sessions.py
+│   │   ├── __init__.py
+│   │   ├── config.py
+├── protos
+│   ├── proxy.proto
 
 === Contenido de archivos ===
------ [Archivo: api/server.go] -----
-// api/server.go
-package api
+----- [Archivo: api/server.py] -----
+"""
+Servidor gRPC para el proxy service
+"""
+import grpc
+from concurrent import futures
+import logging
+import random
+import requests
+import time
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from webdriver_manager.chrome import ChromeDriverManager
 
-import (
-	"context"
-	"fmt"
-	"io"
-	"log"
-	"math/rand"
-	"net"
-	"net/http"
-	"net/url"
-	pb "proxy-api/fetch"
-	"proxy-api/internal/config"
-	"proxy-api/internal/proxy"
-	"proxy-api/internal/scraper"
-	"strings"
-	"sync"
-	"time"
+import proxy_pb2
+import proxy_pb2_grpc
+from internal.config.sessions import PROXY_SESSIONS
+from internal.proxy.proxy import ProxyValidator
+from internal.scraper.scraper import scrape_user_agents
 
-	"google.golang.org/grpc"
-)
+logger = logging.getLogger(__name__)
 
-var (
-	validProxies map[string][]string
-	userAgents   []string
-)
+class ProxyServicer(proxy_pb2_grpc.ProxyServiceServicer):
+    def __init__(self):
+        self.proxy_validator = ProxyValidator()
+        self.valid_proxies = {}
+        self.successful_proxies = {}
+        self.user_agents = []
+        self._initialize()
+    
+    def _initialize(self):
+        """Inicializar el servidor con proxies y user agents"""
+        logger.info("Inicializando servidor...")
+        self.valid_proxies = self.proxy_validator.get_valid_proxies()
+        self.user_agents = scrape_user_agents()
+        logger.info(f"Servidor inicializado con {len(self.user_agents)} user agents")
+    
+    def _get_chrome_options(self, proxy_addr=None):
+        """Configurar opciones de Chrome con proxy opcional"""
+        options = Options()
+        options.add_argument('--headless')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--window-size=1920,1080')
+        
+        if proxy_addr:
+            options.add_argument(f'--proxy-server=http://{proxy_addr}')
+        
+        return options
+    
+    def _create_driver(self, proxy_addr=None, timeout=10):
+        """Crear driver de Selenium con configuración específica"""
+        options = self._get_chrome_options(proxy_addr)
+        
+        try:
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+            driver.set_page_load_timeout(timeout)
+            return driver
+        except Exception as e:
+            logger.error(f"Error creando driver: {e}")
+            return None
+    
+    def _fetch_with_selenium(self, url, session_name, proxy_addr=None, user_agent=None):
+        """Obtener contenido usando Selenium"""
+        session_config = PROXY_SESSIONS.get(session_name)
+        if not session_config:
+            raise ValueError(f"Sesión '{session_name}' no encontrada")
+        
+        timeout = session_config.timeout / 1000  # Convertir a segundos
+        driver = None
+        
+        try:
+            driver = self._create_driver(proxy_addr, timeout)
+            if not driver:
+                raise Exception("No se pudo crear el driver")
+            
+            # Configurar user agent si se proporciona
+            if user_agent:
+                driver.execute_cdp_cmd('Network.setUserAgentOverride', {
+                    "userAgent": user_agent
+                })
+            
+            # Configurar headers adicionales
+            if session_config.headers:
+                for header, value in session_config.headers.items():
+                    driver.execute_cdp_cmd('Network.setRequestInterception', {
+                        'patterns': [{'urlPattern': '*'}]
+                    })
+            
+            # Navegar a la URL
+            driver.get(url)
+            
+            # Esperar a que la página cargue
+            WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            
+            # Obtener el contenido
+            content = driver.page_source.encode('utf-8')
+            
+            if proxy_addr:
+                logger.info(f"Selenium - Proxy: {proxy_addr}, URL: {url}, Content length: {len(content)}")
+            else:
+                logger.info(f"Selenium - Direct, URL: {url}, Content length: {len(content)}")
+            
+            return content
+            
+        except TimeoutException:
+            raise Exception("Timeout esperando a que cargue la página")
+        except WebDriverException as e:
+            raise Exception(f"Error de WebDriver: {str(e)}")
+        except Exception as e:
+            raise Exception(f"Error en Selenium: {str(e)}")
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except:
+                    pass
+    
+    def _fetch_with_requests(self, url, session_name, proxy_addr=None, user_agent=None):
+        """Obtener contenido usando requests como fallback"""
+        session_config = PROXY_SESSIONS.get(session_name)
+        if not session_config:
+            raise ValueError(f"Sesión '{session_name}' no encontrada")
+        
+        headers = session_config.headers.copy()
+        if user_agent:
+            headers['User-Agent'] = user_agent
+        
+        proxies = None
+        if proxy_addr:
+            proxies = {
+                'http': f'http://{proxy_addr}',
+                'https': f'http://{proxy_addr}'
+            }
+        
+        timeout = session_config.timeout / 1000
+        
+        response = requests.get(
+            url,
+            headers=headers,
+            proxies=proxies,
+            timeout=timeout,
+            allow_redirects=True
+        )
+        
+        response.raise_for_status()
+        return response.content
+    
+    def FetchContent(self, request, context):
+        """Implementación del método FetchContent"""
+        try:
+            if not request.session or request.session not in PROXY_SESSIONS:
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details("Sesión inválida")
+                return proxy_pb2.Response()
+            
+            # Seleccionar user agent aleatorio
+            user_agent = None
+            if self.user_agents:
+                user_agent = random.choice(self.user_agents)
+            
+            if request.proxy and request.session in self.valid_proxies:
+                # Intentar con proxies válidos
+                proxies = self.valid_proxies[request.session]
+                if proxies:
+                    proxy_addr = random.choice(proxies)
+                    try:
+                        content = self._fetch_with_selenium(
+                            request.url, 
+                            request.session, 
+                            proxy_addr, 
+                            user_agent
+                        )
+                        return proxy_pb2.Response(content=content)
+                    except Exception as e:
+                        logger.warning(f"Error con proxy {proxy_addr}: {e}")
+                        # Fallback a requests
+                        try:
+                            content = self._fetch_with_requests(
+                                request.url, 
+                                request.session, 
+                                proxy_addr, 
+                                user_agent
+                            )
+                            return proxy_pb2.Response(content=content)
+                        except:
+                            pass
+            
+            # Fallback: sin proxy
+            try:
+                content = self._fetch_with_selenium(
+                    request.url, 
+                    request.session, 
+                    None, 
+                    user_agent
+                )
+                return proxy_pb2.Response(content=content)
+            except Exception as e:
+                logger.warning(f"Error con Selenium directo: {e}")
+                # Fallback final a requests
+                content = self._fetch_with_requests(
+                    request.url, 
+                    request.session, 
+                    None, 
+                    user_agent
+                )
+                return proxy_pb2.Response(content=content)
+                
+        except Exception as e:
+            logger.error(f"Error en FetchContent: {e}")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return proxy_pb2.Response()
+    
+    def GetRandomProxy(self, request, context):
+        """Obtener un proxy aleatorio de una sesión específica"""
+        try:
+            if not request.session:
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details("La sesión no puede estar vacía")
+                return proxy_pb2.ProxyResponse()
+            
+            if request.session not in PROXY_SESSIONS:
+                return proxy_pb2.ProxyResponse(
+                    proxy="",
+                    success=False,
+                    message=f"Sesión '{request.session}' no encontrada en configuración"
+                )
+            
+            proxies = self.valid_proxies.get(request.session, [])
+            if not proxies:
+                return proxy_pb2.ProxyResponse(
+                    proxy="",
+                    success=False,
+                    message=f"No hay proxies válidos disponibles para la sesión '{request.session}'"
+                )
+            
+            selected_proxy = random.choice(proxies)
+            logger.info(f"Proxy aleatorio seleccionado para sesión '{request.session}': {selected_proxy}")
+            
+            return proxy_pb2.ProxyResponse(
+                proxy=selected_proxy,
+                success=True,
+                message=f"Proxy seleccionado exitosamente para la sesión '{request.session}'"
+            )
+            
+        except Exception as e:
+            logger.error(f"Error en GetRandomProxy: {e}")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return proxy_pb2.ProxyResponse()
+    
+    def GetProxyStats(self, request, context):
+        """Obtener estadísticas de proxies por sesión"""
+        try:
+            stats = {}
+            total_proxies = 0
+            
+            for session, proxies in self.valid_proxies.items():
+                count = len(proxies)
+                stats[session] = count
+                total_proxies += count
+            
+            return proxy_pb2.StatsResponse(
+                proxy_count_by_session=stats,
+                total_valid_proxies=total_proxies
+            )
+            
+        except Exception as e:
+            logger.error(f"Error en GetProxyStats: {e}")
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return proxy_pb2.StatsResponse()
 
-type server struct {
-	pb.UnimplementedProxyServiceServer
-	successfulProxies map[string]*http.Client
-	mtx               sync.RWMutex
-}
-
-var errorMap = map[string]struct{}{
-	"context deadline exceeded (Client.Timeout or context cancellation while reading body)": {},
-	"EOF":                       {},
-	"read tcp":                  {},
-	"connection":                {},
-	"Timeout":                   {},
-	"Forbidden":                 {},
-	"(Client.Timeout":           {},
-	"Internal Server Error":     {},
-	"Bad Gateway":               {},
-	"Service Unavailable":       {},
-	"Gateway Timeout":           {},
-	"Too many open connections": {},
-	"unconfigured cipher suite": {},
-	"ClientConn.Close":          {},
-	"GOAWAY":                    {},
-	"proxyconnect tcp:":         {},
-	"Temporary Redirect":        {},
-	"Internal Privoxy Error":    {},
-	"certificate":               {},
-	"bad record MAC":            {},
-	"lookup":                    {},
-}
-
-func isTimeoutError(err error) bool {
-	if urlErr, ok := err.(*url.Error); ok && urlErr.Timeout() {
-		return true
-	}
-
-	for errMsg := range errorMap {
-		if strings.Contains(err.Error(), errMsg) || err.Error() == errMsg {
-			return true
-		}
-	}
-
-	return false
-}
-
-var nilMap = map[string]struct{}{
-	"<strong>Error:</strong>": {},
-	"Marshal":                 {},
-	"error while marshaling: proto: Marshal called with nilh": {},
-	"Servicio no": {},
-	"GOAWAY":      {},
-	`http2: server sent GOAWAY and closed the connection;`:                      {},
-	`{"code":110,"message":"Sport API error","name":"ServiceUnavailableError"}`: {},
-	"http2:":          {},
-	"temporary error": {},
-}
-
-func IsNilContent(content string) bool {
-	for errMsg := range nilMap {
-		if strings.Contains(content, errMsg) || content == errMsg {
-			return true
-		}
-	}
-
-	return false
-}
-
-func (s *server) getHTTPClient(proxyAddr string, redirect bool, session string) (*http.Client, error) {
-	s.mtx.RLock()
-	client, ok := s.successfulProxies[proxyAddr]
-	s.mtx.RUnlock()
-
-	if ok {
-		return client, nil
-	}
-
-	if proxyAddr == "default" {
-		return http.DefaultClient, nil
-	}
-
-	proxyURL, _ := url.Parse(proxyAddr)
-	client = &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyURL(proxyURL),
-		},
-		Timeout: time.Duration(config.ProxySessions[session].Timeout) * time.Millisecond,
-	}
-
-	if !redirect {
-		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		}
-	} else {
-		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			return nil
-		}
-	}
-
-	s.mtx.Lock()
-	s.successfulProxies[proxyAddr] = client
-	s.mtx.Unlock()
-
-	return client, nil
-}
-
-func (s *server) removeSuccesfulProxy(proxyAddr string) {
-	s.mtx.Lock()
-	delete(s.successfulProxies, proxyAddr)
-	s.mtx.Unlock()
-}
-
-// GetRandomProxy - Nuevo método para obtener un proxy aleatorio de una sesión específica
-func (s *server) GetRandomProxy(ctx context.Context, req *pb.ProxyRequest) (*pb.ProxyResponse, error) {
-	if req.Session == "" {
-		return nil, fmt.Errorf("session cannot be empty")
-	}
-
-	// Verificar si la sesión existe en la configuración
-	if _, exists := config.ProxySessions[req.Session]; !exists {
-		return nil, fmt.Errorf("session '%s' not found in configuration", req.Session)
-	}
-
-	// Verificar si hay proxies válidos para esta sesión
-	proxies, exists := validProxies[req.Session]
-	if !exists || len(proxies) == 0 {
-		return &pb.ProxyResponse{
-			Proxy:   "",
-			Success: false,
-			Message: fmt.Sprintf("no valid proxies available for session '%s'", req.Session),
-		}, nil
-	}
-
-	// Seleccionar un proxy aleatorio
-	randomIndex := rand.Intn(len(proxies))
-	selectedProxy := proxies[randomIndex]
-
-	log.Printf("Selected random proxy for session '%s': %s", req.Session, selectedProxy)
-
-	return &pb.ProxyResponse{
-		Proxy:   selectedProxy,
-		Success: true,
-		Message: fmt.Sprintf("proxy selected successfully for session '%s'", req.Session),
-	}, nil
-}
-
-// GetProxyStats - Método adicional para obtener estadísticas de proxies por sesión
-func (s *server) GetProxyStats(ctx context.Context, req *pb.StatsRequest) (*pb.StatsResponse, error) {
-	stats := make(map[string]int32)
-	
-	for session, proxies := range validProxies {
-		stats[session] = int32(len(proxies))
-	}
-
-	return &pb.StatsResponse{
-		ProxyCountBySession: stats,
-		TotalValidProxies:   int32(getTotalProxyCount()),
-	}, nil
-}
-
-func getTotalProxyCount() int {
-	total := 0
-	for _, proxies := range validProxies {
-		total += len(proxies)
-	}
-	return total
-}
-
-// WITHOUT PROXIES
-func (s *server) Fetch(ctx context.Context, req *pb.Request, userAgent string, redirect bool) (*pb.Response, error) {
-	client, err := s.getHTTPClient("default", redirect, req.Session)
-	if err != nil {
-		return nil, err
-	}
-
-	reqObj, err := http.NewRequestWithContext(ctx, "GET", req.Url, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	reqObj.Header.Set("User-Agent", userAgent)
-	for k, v := range config.GetHeadersFromSession(req.Session) {
-		reqObj.Header.Set(k, v)
-	}
-
-	resp, err := client.Do(reqObj)
-	if err != nil {
-		// Retry if there is a timeout error.
-		if ctx.Err() == context.DeadlineExceeded || isTimeoutError(err) {
-			log.Println("Retry due to", err)
-			return s.Fetch(ctx, req, userAgent, redirect)
-		}
-
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	log.Printf("User-Agent: %s, Status: %d, URL: %s\n", userAgent, resp.StatusCode, req.Url)
-	return &pb.Response{Content: bodyBytes}, nil
-}
-
-func (s *server) useProxyToFetch(ctx context.Context, req *pb.Request, proxyAddr string, userAgent string, redirect bool, contentChan chan []byte, errorChan chan error) {
-	client, err := s.getHTTPClient(proxyAddr, redirect, req.Session)
-	if err != nil {
-		errorChan <- err
-		return
-	}
-
-	reqObj, err := http.NewRequestWithContext(ctx, "GET", req.Url, nil)
-	if err != nil {
-		errorChan <- err
-		return
-	}
-
-	reqObj.Header.Set("User-Agent", userAgent)
-	for k, v := range config.GetHeadersFromSession(req.Session) {
-		reqObj.Header.Set(k, v)
-	}
-
-	resp, err := client.Do(reqObj)
-	if err != nil {
-		s.removeSuccesfulProxy(proxyAddr) // remove the proxy from successfulProxies
-		errorChan <- err
-		return
-	}
-	defer resp.Body.Close()
-
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		errorChan <- err
-		return
-	}
-
-	log.Printf("Proxy: %s, User-Agent: %s, Status: %d, URL: %s", proxyAddr, userAgent, resp.StatusCode, req.Url)
-	contentChan <- bodyBytes
-}
-
-func (s *server) FetchContent(ctx context.Context, req *pb.Request) (*pb.Response, error) {
-	if req.Session == "" || validProxies[req.Session] == nil {
-		return nil, fmt.Errorf("invalid session")
-	}
-
-	var redirect bool
-	if req.Redirect {
-		redirect = req.Redirect
-	} else {
-		redirect = false
-	}
-
-	selectedUserAgent := userAgents[rand.Intn(len(userAgents))]
-
-	if req.Proxy {
-		contentChan := make(chan []byte)
-		errorChan := make(chan error)
-
-		// Primero se utilizan los successfulProxies
-		s.mtx.RLock()
-		for proxyAddr := range s.successfulProxies {
-			go s.useProxyToFetch(ctx, req, "http://"+proxyAddr, selectedUserAgent, redirect, contentChan, errorChan)
-		}
-		s.mtx.RUnlock()
-
-		// Si falla, utiliza los validProxies
-		if len(contentChan) == 0 {
-			for _, proxyAddr := range validProxies[req.Session] {
-				go s.useProxyToFetch(ctx, req, "http://"+proxyAddr, selectedUserAgent, redirect, contentChan, errorChan)
-			}
-		}
-
-		for range validProxies[req.Session] {
-			select {
-			case content := <-contentChan:
-				return &pb.Response{Content: content}, nil
-			case <-errorChan:
-				continue
-			}
-		}
-
-		return s.Fetch(ctx, req, selectedUserAgent, redirect)
-	}
-
-	return s.Fetch(ctx, req, selectedUserAgent, redirect)
-}
-
-func UpdateValidProxies(proxies map[string][]string) {
-	validProxies = proxies
-}
-
-func StartGRPCServer() {
-	validProxies = proxy.GetValidProxies()
-	userAgents = scraper.ScrapeUserAgents()
-
-	log.Println("Iniciando servidor gRPC")
-	lis, err := net.Listen("tcp", ":5000")
-	if err != nil {
-		log.Fatalf("failed to listen: %v", err)
-	}
-
-	maxSize := 5 * 1024 * 1024
-	grpcServer := grpc.NewServer(
-		grpc.MaxRecvMsgSize(maxSize), // Tamaño máximo de mensaje recibido.
-		grpc.MaxSendMsgSize(maxSize), // Tamaño máximo de mensaje enviado.
-	)
-	pb.RegisterProxyServiceServer(grpcServer, &server{successfulProxies: make(map[string]*http.Client)})
-	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("failed to serve: %v", err)
-	}
-}
------ [Archivo: cmd/main.go] -----
-package main
-
-import (
-	"fmt"
-	"proxy-api/api"
-	"proxy-api/internal/config"
-	"proxy-api/internal/proxy"
-	"time"
-)
-
-func main() {
-	// Iniciar el servidor gRPC
-	go api.StartGRPCServer()
-
-	// Refrescar proxies al inicio
-	go reloadProxiesInBackground()
-
-	// Mantener la aplicación en ejecución
-	select {}
-}
-
-func reloadProxiesInBackground() {
-	for {
-		time.Sleep(config.UpdateTime * time.Minute)
-
-		newProxyMap := proxy.GetValidProxies()
-		fmt.Printf("Proxies válidos refrescados: %d\n", len(newProxyMap))
-
-		// Update the valid proxies in the server
-		api.UpdateValidProxies(newProxyMap)
-	}
-}
-
+def start_grpc_server():
+    """Iniciar el servidor gRPC"""
+    logger.info("Iniciando servidor gRPC en puerto 5000")
+    
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    proxy_pb2_grpc.add_ProxyServiceServicer_to_server(ProxyServicer(), server)
+    
+    listen_addr = '[::]:5000'
+    server.add_insecure_port(listen_addr)
+    
+    server.start()
+    logger.info(f"Servidor gRPC iniciado en {listen_addr}")
+    
+    try:
+        server.wait_for_termination()
+    except KeyboardInterrupt:
+        logger.info("Cerrando servidor gRPC...")
+        server.stop(0)
 ----- [Archivo: docker-compose.yml] -----
-version: "3.8"
-
 services:
-  api:
+  proxy-server:
     build: .
-    container_name: proxy_server
+    container_name: proxy_server_python
     ports:
       - "5000:5000"
     restart: always
+    environment:
+      - DISPLAY=:99
+    volumes:
+      - /dev/shm:/dev/shm
     networks:
       - proxy_network
 
@@ -412,147 +345,471 @@ networks:
   proxy_network:
     driver: bridge
     name: proxy_network
-    
 ----- [Archivo: Dockerfile] -----
-# Usa una imagen de Go como base
-FROM golang AS builder
+## Dockerfile
+FROM python:3.11-slim
 
-# Configura las variables de entorno
-ENV GO111MODULE=on \
-    CGO_ENABLED=0 \
-    GOOS=linux \
-    GOARCH=amd64
+# Instalar dependencias del sistema
+RUN apt-get update && apt-get install -y \
+    wget \
+    gnupg \
+    unzip \
+    curl \
+    xvfb \
+    && rm -rf /var/lib/apt/lists/*
 
-# Crea un directorio de trabajo dentro del contenedor
-WORKDIR /build
+# Instalar Chrome
+RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
+    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list \
+    && apt-get update \
+    && apt-get install -y google-chrome-stable \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copia los archivos del proyecto al directorio de trabajo
-COPY . .
-
-# Compila la aplicación
-RUN go build -o main ./cmd/main.go
-
-# Empieza a construir la imagen final
-FROM alpine:latest
-
-# Instala las dependencias necesarias
-RUN apk --no-cache add ca-certificates
-
-# Copia el binario compilado desde la etapa anterior
-COPY --from=builder /build/main /app/main
-
-# Establece el directorio de trabajo
+# Establecer directorio de trabajo
 WORKDIR /app
 
-# Expone el puerto en el que la aplicación escucha
+# Copiar requirements y instalar dependencias Python
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copiar el código fuente
+COPY . .
+
+# Generar archivos proto
+RUN python -m grpc_tools.protoc \
+    --proto_path=protos \
+    --python_out=. \
+    --grpc_python_out=. \
+    protos/proxy.proto
+
+# Exponer puerto
 EXPOSE 5000
 
-# Ejecuta la aplicación cuando el contenedor se inicia
-CMD ["./main"]
------ [Archivo: fix.sh] -----
-#!/usr/bin/env bash
+# Comando de inicio
+CMD ["python", "main.py"]
+----- [Archivo: internal/config/config.py] -----
+"""
+Configuración general del sistema
+"""
 
-# Script para resolver problemas de compatibilidad con gRPC
-set -e
+# Tamaño del chunk de proxies para procesamiento
+DEFAULT_CHUNK_SIZE = 20
 
-echo "=== Solucionando problemas de compatibilidad gRPC ==="
+# Timeout por defecto para sesiones (en milisegundos)
+DEFAULT_SESSION_TIMEOUT = 2000
 
-# Colores para output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+# Tiempo de actualización de proxies (en minutos)
+UPDATE_TIME_MINUTES = 30
 
-# Función para imprimir mensajes coloreados
-print_status() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+# Configuración de Selenium
+SELENIUM_TIMEOUT = 10  # segundos
+SELENIUM_RETRIES = 3
+
+# User agents por defecto
+DEFAULT_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+]
+----- [Archivo: internal/config/__init__.py] -----
+
+----- [Archivo: internal/config/sessions.py] -----
+"""
+Configuración de sesiones para diferentes sitios web
+"""
+from dataclasses import dataclass
+from typing import Dict
+from .config import DEFAULT_SESSION_TIMEOUT
+
+@dataclass
+class ProxySession:
+    name: str
+    url: str
+    headers: Dict[str, str]
+    timeout: int = DEFAULT_SESSION_TIMEOUT
+
+# Sesiones configuradas
+PROXY_SESSIONS = {
+    "CoinMarketCap": ProxySession(
+        name="CoinMarketCap",
+        url="https://coinmarketcap.com/es/",
+        headers={
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        },
+        timeout=DEFAULT_SESSION_TIMEOUT,
+    ),
 }
 
-print_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
+def get_headers_from_session(session_name: str) -> Dict[str, str]:
+    """Obtener headers de una sesión específica"""
+    session = PROXY_SESSIONS.get(session_name)
+    return session.headers if session else {}
+----- [Archivo: internal/__init__.py] -----
 
-print_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
+----- [Archivo: internal/proxy/__init__.py] -----
 
-# 1. Verificar que Go está instalado
-if ! command -v go &> /dev/null; then
-    print_error "Go no está instalado. Por favor instálalo desde https://golang.org/"
-    exit 1
-fi
+----- [Archivo: internal/proxy/proxy.py] -----
+"""
+Validación y gestión de proxies usando Selenium
+"""
+import logging
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from webdriver_manager.chrome import ChromeDriverManager
 
-print_status "Go versión: $(go version)"
+from ..config.config import DEFAULT_CHUNK_SIZE, SELENIUM_TIMEOUT
+from ..config.sessions import PROXY_SESSIONS
+from ..scraper.scraper import scrape_proxies
 
-# 2. Limpiar módulos y caché
-print_status "Limpiando caché de módulos Go..."
-go clean -modcache
-go mod tidy
+logger = logging.getLogger(__name__)
 
-# 3. Actualizar dependencias
-print_status "Actualizando dependencias..."
-go get -u google.golang.org/grpc@latest
-go get -u google.golang.org/protobuf@latest
-go mod tidy
+class ProxyValidator:
+    def __init__(self, chunk_size: int = DEFAULT_CHUNK_SIZE):
+        self.chunk_size = chunk_size
+        self.valid_proxies: Dict[str, List[str]] = {}
+        self._lock = threading.RLock()
+    
+    def _get_chrome_options(self, proxy_addr: str) -> Options:
+        """Configurar opciones de Chrome para validación de proxies"""
+        options = Options()
+        options.add_argument('--headless')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--disable-logging')
+        options.add_argument('--disable-extensions')
+        options.add_argument('--window-size=1920,1080')
+        options.add_argument(f'--proxy-server=http://{proxy_addr}')
+        
+        # Configuraciones adicionales para mayor estabilidad
+        options.add_argument('--no-first-run')
+        options.add_argument('--disable-default-apps')
+        options.add_argument('--disable-popup-blocking')
+        
+        return options
+    
+    def _create_driver(self, proxy_addr: str) -> webdriver.Chrome:
+        """Crear driver de Chrome configurado con proxy"""
+        options = self._get_chrome_options(proxy_addr)
+        
+        try:
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+            driver.set_page_load_timeout(SELENIUM_TIMEOUT)
+            return driver
+        except Exception as e:
+            logger.debug(f"Error creando driver para proxy {proxy_addr}: {e}")
+            raise
+    
+    def _test_proxy_with_session(self, proxy_addr: str, session_name: str, session_config) -> bool:
+        """Probar un proxy específico con una sesión específica usando Selenium"""
+        driver = None
+        try:
+            driver = self._create_driver(proxy_addr)
+            
+            # Navegar a la URL de prueba
+            driver.get(session_config.url)
+            
+            # Esperar a que la página cargue
+            WebDriverWait(driver, SELENIUM_TIMEOUT).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            
+            # Verificar que el contenido es válido
+            page_source = driver.page_source
+            if len(page_source) > 100 and "error" not in page_source.lower():
+                logger.debug(f"Proxy {proxy_addr} válido para {session_name}")
+                return True
+            else:
+                logger.debug(f"Proxy {proxy_addr} contenido inválido para {session_name}")
+                return False
+                
+        except TimeoutException:
+            logger.debug(f"Timeout con proxy {proxy_addr} para {session_name}")
+            return False
+        except WebDriverException as e:
+            logger.debug(f"WebDriver error con proxy {proxy_addr} para {session_name}: {e}")
+            return False
+        except Exception as e:
+            logger.debug(f"Error con proxy {proxy_addr} para {session_name}: {e}")
+            return False
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except:
+                    pass
+    
+    def _test_proxy_all_sessions(self, proxy_addr: str) -> None:
+        """Probar un proxy con todas las sesiones configuradas"""
+        for session_name, session_config in PROXY_SESSIONS.items():
+            if self._test_proxy_with_session(proxy_addr, session_name, session_config):
+                with self._lock:
+                    if session_name not in self.valid_proxies:
+                        self.valid_proxies[session_name] = []
+                    self.valid_proxies[session_name].append(proxy_addr)
+    
+    def _chunk_proxies(self, proxies: List[str]) -> List[List[str]]:
+        """Dividir lista de proxies en chunks más manejables"""
+        chunks = []
+        for i in range(0, len(proxies), self.chunk_size):
+            end = i + self.chunk_size
+            if end > len(proxies):
+                end = len(proxies)
+            chunks.append(proxies[i:end])
+        return chunks
+    
+    def get_valid_proxies(self) -> Dict[str, List[str]]:
+        """Obtener y validar proxies usando Selenium"""
+        logger.info("Iniciando validación de proxies con Selenium...")
+        
+        # Limpiar proxies válidos anteriores
+        with self._lock:
+            self.valid_proxies.clear()
+        
+        # Obtener lista de proxies
+        proxies = scrape_proxies()
+        if not proxies:
+            logger.warning("No se obtuvieron proxies para validar")
+            return {}
+        
+        logger.info(f"Validando {len(proxies)} proxies...")
+        
+        # Dividir en chunks para procesamiento
+        chunks = self._chunk_proxies(proxies)
+        
+        # Procesar chunks con ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            chunk_futures = []
+            
+            for chunk_idx, chunk in enumerate(chunks):
+                future = executor.submit(self._process_chunk, chunk, chunk_idx, len(chunks))
+                chunk_futures.append(future)
+            
+            # Esperar a que terminen todos los chunks
+            for future in as_completed(chunk_futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error procesando chunk: {e}")
+        
+        # Mostrar estadísticas finales
+        with self._lock:
+            total_valid = sum(len(proxies) for proxies in self.valid_proxies.values())
+            logger.info(f"Validación completada. Total de proxies válidos: {total_valid}")
+            
+            for session, proxy_list in self.valid_proxies.items():
+                logger.info(f"Sesión {session}: {len(proxy_list)} proxies válidos")
+            
+            return self.valid_proxies.copy()
+    
+    def _process_chunk(self, chunk: List[str], chunk_idx: int, total_chunks: int) -> None:
+        """Procesar un chunk de proxies"""
+        logger.info(f"Procesando chunk {chunk_idx + 1}/{total_chunks} ({len(chunk)} proxies)")
+        
+        # Procesar proxies del chunk con ThreadPoolExecutor más pequeño
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            proxy_futures = []
+            
+            for proxy in chunk:
+                future = executor.submit(self._test_proxy_all_sessions, proxy)
+                proxy_futures.append(future)
+            
+            # Esperar a que terminen todos los proxies del chunk
+            for future in as_completed(proxy_futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.debug(f"Error validando proxy: {e}")
+        
+        logger.info(f"Chunk {chunk_idx + 1}/{total_chunks} completado")
+----- [Archivo: internal/scraper/scraper.py] -----
+"""
+Scraping de proxies y user agents
+"""
+import logging
+import requests
+from typing import List
+import time
 
-# 4. Instalar/actualizar herramientas de protoc
-print_status "Instalando herramientas de Protocol Buffers..."
+logger = logging.getLogger(__name__)
 
-# Verificar si protoc está instalado
-if ! command -v protoc &> /dev/null; then
-    print_error "protoc no está instalado."
-    echo "Por favor instálalo:"
-    echo "  - Ubuntu/Debian: sudo apt install protobuf-compiler"
-    echo "  - macOS: brew install protobuf"
-    echo "  - Windows: Descarga desde https://github.com/protocolbuffers/protobuf/releases"
-    exit 1
-fi
+def scrape_proxies() -> List[str]:
+    """Scraping de proxies desde fuentes públicas"""
+    proxy_urls = [
+        "https://raw.githubusercontent.com/officialputuid/KangProxy/refs/heads/KangProxy/https/https.txt",
+        "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/refs/heads/master/https.txt",
+        # Comentadas las fuentes menos confiables
+        # "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+        # "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/all/data.txt",
+    ]
+    
+    all_proxies = []
+    
+    for url in proxy_urls:
+        try:
+            logger.info(f"Obteniendo proxies de {url}")
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            
+            lines = response.text.strip().split('\n')
+            valid_proxies = []
+            
+            for line in lines:
+                line = line.strip()
+                if line and ':' in line:
+                    # Limpiar formato de proxy si tiene múltiples ':'
+                    parts = line.split(':')
+                    if len(parts) >= 2:
+                        proxy = f"{parts[0]}:{parts[1]}"
+                        valid_proxies.append(proxy)
+            
+            all_proxies.extend(valid_proxies)
+            logger.info(f"Obtenidos {len(valid_proxies)} proxies de {url}")
+            
+        except requests.RequestException as e:
+            logger.warning(f"Error obteniendo proxies de {url}: {e}")
+        except Exception as e:
+            logger.error(f"Error inesperado con {url}: {e}")
+    
+    # Eliminar duplicados manteniendo orden
+    unique_proxies = list(dict.fromkeys(all_proxies))
+    logger.info(f"Total de proxies únicos obtenidos: {len(unique_proxies)}")
+    
+    return unique_proxies
 
-print_status "protoc versión: $(protoc --version)"
+def scrape_user_agents() -> List[str]:
+    """Scraping de user agents"""
+    user_agent_urls = [
+        "https://gist.githubusercontent.com/pzb/b4b6f57144aea7827ae4/raw/cf847b76a142955b1410c8bcef3aabe221a63db1/user-agents.txt",
+    ]
+    
+    all_user_agents = []
+    max_retries = 3
+    
+    for url in user_agent_urls:
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Obteniendo user agents de {url} (intento {attempt + 1})")
+                response = requests.get(url, timeout=10)
+                response.raise_for_status()
+                
+                lines = response.text.strip().split('\n')
+                valid_user_agents = []
+                
+                for line in lines:
+                    line = line.strip()
+                    # Filtrar user agents móviles y problemáticos
+                    if (line and 
+                        not any(mobile in line for mobile in ['Android', 'iPhone', 'iPad', 'Mobile']) and
+                        'Mozilla/' in line):
+                        valid_user_agents.append(line)
+                
+                all_user_agents.extend(valid_user_agents)
+                logger.info(f"Obtenidos {len(valid_user_agents)} user agents de {url}")
+                break  # Éxito, salir del bucle de reintentos
+                
+            except requests.RequestException as e:
+                logger.warning(f"Error obteniendo user agents de {url} (intento {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)  # Esperar antes del siguiente intento
+            except Exception as e:
+                logger.error(f"Error inesperado con {url}: {e}")
+                break
+    
+    # Si no se obtuvieron user agents, usar valores por defecto
+    if not all_user_agents:
+        logger.warning("No se pudieron obtener user agents, usando valores por defecto")
+        from ..config.config import DEFAULT_USER_AGENTS
+        all_user_agents = DEFAULT_USER_AGENTS
+    
+    # Eliminar duplicados
+    unique_user_agents = list(dict.fromkeys(all_user_agents))
+    logger.info(f"Total de user agents únicos: {len(unique_user_agents)}")
+    
+    return unique_user_agents
+----- [Archivo: main.py] -----
+"""
+Punto de entrada principal del proxy server
+"""
+import asyncio
+import logging
+import threading
+import time
+from api.server import start_grpc_server
+from internal.proxy.proxy import ProxyValidator
+from internal.config.config import UPDATE_TIME_MINUTES
 
-# Instalar plugins de Go para protoc
-print_status "Instalando plugins de protoc para Go..."
-go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+# Configurar logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# Verificar que los plugins están en el PATH
-if ! command -v protoc-gen-go &> /dev/null; then
-    print_warning "protoc-gen-go no está en el PATH"
-    echo "Asegúrate de que \$GOPATH/bin está en tu PATH:"
-    echo "export PATH=\$PATH:\$(go env GOPATH)/bin"
-fi
+def reload_proxies_background():
+    """Función para recargar proxies en segundo plano"""
+    proxy_validator = ProxyValidator()
+    
+    while True:
+        try:
+            time.sleep(UPDATE_TIME_MINUTES * 60)
+            logger.info("Iniciando recarga de proxies...")
+            
+            new_proxy_map = proxy_validator.get_valid_proxies()
+            total_proxies = sum(len(proxies) for proxies in new_proxy_map.values())
+            
+            logger.info(f"Proxies válidos refrescados: {total_proxies}")
+            
+        except Exception as e:
+            logger.error(f"Error recargando proxies: {e}")
 
-if ! command -v protoc-gen-go-grpc &> /dev/null; then
-    print_warning "protoc-gen-go-grpc no está en el PATH"
-    echo "Asegúrate de que \$GOPATH/bin está en tu PATH:"
-    echo "export PATH=\$PATH:\$(go env GOPATH)/bin"
-fi
+def main():
+    """Función principal"""
+    logger.info("Iniciando Proxy Server Python con Selenium")
+    
+    # Iniciar el servidor gRPC en un hilo separado
+    grpc_thread = threading.Thread(target=start_grpc_server, daemon=True)
+    grpc_thread.start()
+    
+    # Iniciar la recarga de proxies en segundo plano
+    reload_thread = threading.Thread(target=reload_proxies_background, daemon=True)
+    reload_thread.start()
+    
+    try:
+        # Mantener la aplicación en ejecución
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("Cerrando servidor...")
 
-# 5. Crear directorio fetch si no existe
-mkdir -p fetch
-
-# 6. Crear archivo proto actualizado
-print_status "Creando archivo proto actualizado..."
-cat > fetch/proxy.proto << 'EOF'
+if __name__ == "__main__":
+    main()
+----- [Archivo: protos/proxy.proto] -----
 syntax = "proto3";
 
-package fetch;
+package proxy;
 
-option go_package = "proxy-api/fetch";
-
-// Servicio principal de proxy
 service ProxyService {
-    // Método existente para obtener contenido
     rpc FetchContent(Request) returns (Response);
-    
-    // Nuevo método para obtener un proxy aleatorio
     rpc GetRandomProxy(ProxyRequest) returns (ProxyResponse);
-    
-    // Método adicional para obtener estadísticas de proxies
     rpc GetProxyStats(StatsRequest) returns (StatsResponse);
 }
 
-// Mensaje de solicitud existente
 message Request {
     string url = 1;
     string session = 2;
@@ -560,634 +817,501 @@ message Request {
     bool redirect = 4;
 }
 
-// Mensaje de respuesta existente
 message Response {
     bytes content = 1;
 }
 
-// Nuevo mensaje para solicitar un proxy aleatorio
 message ProxyRequest {
-    string session = 1; // Sesión para la cual obtener el proxy
+    string session = 1;
 }
 
-// Nuevo mensaje de respuesta para proxy aleatorio
 message ProxyResponse {
-    string proxy = 1;   // Dirección del proxy (ip:port)
-    bool success = 2;   // Indica si la operación fue exitosa
-    string message = 3; // Mensaje descriptivo del resultado
+    string proxy = 1;
+    bool success = 2;
+    string message = 3;
 }
 
-// Mensaje para solicitar estadísticas
 message StatsRequest {
-    // Vacío por ahora, podría expandirse en el futuro
+    // Vacío por ahora
 }
 
-// Mensaje de respuesta con estadísticas
 message StatsResponse {
-    map<string, int32> proxy_count_by_session = 1; // Cantidad de proxies por sesión
-    int32 total_valid_proxies = 2;                 // Total de proxies válidos
+    map<string, int32> proxy_count_by_session = 1;
+    int32 total_valid_proxies = 2;
 }
-EOF
+----- [Archivo: proxy_pb2_grpc.py] -----
+# Generated by the gRPC Python protocol compiler plugin. DO NOT EDIT!
+"""Client and server classes corresponding to protobuf-defined services."""
+import grpc
+import warnings
 
-# 7. Eliminar archivos proto generados anteriormente
-print_status "Eliminando archivos proto generados anteriormente..."
-rm -f fetch/*.pb.go
+import proxy_pb2 as proxy__pb2
 
-# 8. Generar nuevos archivos proto
-print_status "Generando archivos proto..."
-protoc \
-    --proto_path=fetch \
-    --go_out=fetch \
-    --go_opt=paths=source_relative \
-    --go-grpc_out=fetch \
-    --go-grpc_opt=paths=source_relative \
-    fetch/proxy.proto
+GRPC_GENERATED_VERSION = '1.74.0'
+GRPC_VERSION = grpc.__version__
+_version_not_supported = False
 
-# 9. Verificar que los archivos se generaron correctamente
-if [ -f "fetch/proxy.pb.go" ] && [ -f "fetch/proxy_grpc.pb.go" ]; then
-    print_status "✅ Archivos proto generados exitosamente"
-else
-    print_error "❌ Error generando archivos proto"
-    exit 1
-fi
+try:
+    from grpc._utilities import first_version_is_lower
+    _version_not_supported = first_version_is_lower(GRPC_VERSION, GRPC_GENERATED_VERSION)
+except ImportError:
+    _version_not_supported = True
 
-# 10. Intentar compilar el proyecto
-print_status "Verificando compilación del proyecto..."
-if go build ./cmd/main.go; then
-    print_status "✅ Proyecto compilado exitosamente"
-    rm -f main # Limpiar binario de prueba
-else
-    print_error "❌ Error compilando el proyecto"
-    echo "Revisa los errores anteriores e intenta de nuevo"
-    exit 1
-fi
+if _version_not_supported:
+    raise RuntimeError(
+        f'The grpc package installed is at version {GRPC_VERSION},'
+        + f' but the generated code in proxy_pb2_grpc.py depends on'
+        + f' grpcio>={GRPC_GENERATED_VERSION}.'
+        + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
+        + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
+    )
 
-# 11. Mostrar información de las dependencias
-print_status "Información de dependencias actuales:"
-go list -m all | grep -E "(grpc|protobuf)"
 
-echo ""
-print_status "🎉 ¡Problema resuelto! El proyecto debería compilar correctamente ahora."
-echo ""
-echo "Próximos pasos:"
-echo "1. go build ./cmd/main.go"
-echo "2. ./main"
-echo "3. go run client/main.go (en otra terminal)"
------ [Archivo: generateProxyProto.sh] -----
-#!/usr/bin/env bash
+class ProxyServiceStub(object):
+    """Missing associated documentation comment in .proto file."""
 
-# Script para generar archivos gRPC desde el archivo proto
-# Asegúrate de tener instalados:
-# - protoc (Protocol Buffers compiler)
-# - protoc-gen-go (Go plugin para protoc)
-# - protoc-gen-go-grpc (gRPC Go plugin)
+    def __init__(self, channel):
+        """Constructor.
 
-set -e
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.FetchContent = channel.unary_unary(
+                '/proxy.ProxyService/FetchContent',
+                request_serializer=proxy__pb2.Request.SerializeToString,
+                response_deserializer=proxy__pb2.Response.FromString,
+                _registered_method=True)
+        self.GetRandomProxy = channel.unary_unary(
+                '/proxy.ProxyService/GetRandomProxy',
+                request_serializer=proxy__pb2.ProxyRequest.SerializeToString,
+                response_deserializer=proxy__pb2.ProxyResponse.FromString,
+                _registered_method=True)
+        self.GetProxyStats = channel.unary_unary(
+                '/proxy.ProxyService/GetProxyStats',
+                request_serializer=proxy__pb2.StatsRequest.SerializeToString,
+                response_deserializer=proxy__pb2.StatsResponse.FromString,
+                _registered_method=True)
 
-echo "=== Generando archivos gRPC desde proxy_service.proto ==="
 
-# Directorio donde está el archivo proto
-PROTO_DIR="fetch/"
-# Directorio de salida para los archivos generados
-OUT_DIR="fetch/"
+class ProxyServiceServicer(object):
+    """Missing associated documentation comment in .proto file."""
 
-# Crear directorio de salida si no existe
-mkdir -p "$OUT_DIR"
+    def FetchContent(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
-# Verificar que existe el archivo proto
-if [ ! -f "$PROTO_DIR/proxy_service.proto" ]; then
-    echo "Error: No se encontró el archivo proxy_service.proto en $PROTO_DIR"
-    echo "Por favor asegúrate de que el archivo proto existe."
-    exit 1
-fi
+    def GetRandomProxy(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
-# Verificar que protoc está instalado
-if ! command -v protoc &> /dev/null; then
-    echo "Error: protoc no está instalado."
-    echo "Instálalo desde: https://grpc.io/docs/protoc-installation/"
-    exit 1
-fi
+    def GetProxyStats(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
 
-# Verificar que los plugins de Go están instalados
-if ! command -v protoc-gen-go &> /dev/null; then
-    echo "Error: protoc-gen-go no está instalado."
-    echo "Instálalo con: go install google.golang.org/protobuf/cmd/protoc-gen-go@latest"
-    exit 1
-fi
 
-if ! command -v protoc-gen-go-grpc &> /dev/null; then
-    echo "Error: protoc-gen-go-grpc no está instalado."
-    echo "Instálalo con: go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest"
-    exit 1
-fi
+def add_ProxyServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'FetchContent': grpc.unary_unary_rpc_method_handler(
+                    servicer.FetchContent,
+                    request_deserializer=proxy__pb2.Request.FromString,
+                    response_serializer=proxy__pb2.Response.SerializeToString,
+            ),
+            'GetRandomProxy': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetRandomProxy,
+                    request_deserializer=proxy__pb2.ProxyRequest.FromString,
+                    response_serializer=proxy__pb2.ProxyResponse.SerializeToString,
+            ),
+            'GetProxyStats': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetProxyStats,
+                    request_deserializer=proxy__pb2.StatsRequest.FromString,
+                    response_serializer=proxy__pb2.StatsResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'proxy.ProxyService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('proxy.ProxyService', rpc_method_handlers)
 
-echo "Generando archivos Go desde proxy_service.proto..."
 
-# Generar archivos Go
-protoc \
-    --proto_path="$PROTO_DIR" \
-    --go_out="$OUT_DIR" \
-    --go_opt=paths=source_relative \
-    --go-grpc_out="$OUT_DIR" \
-    --go-grpc_opt=paths=source_relative \
-    "$PROTO_DIR/proxy_service.proto"
+ # This class is part of an EXPERIMENTAL API.
+class ProxyService(object):
+    """Missing associated documentation comment in .proto file."""
 
-echo "✅ Archivos Go generados exitosamente en $OUT_DIR"
+    @staticmethod
+    def FetchContent(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/proxy.ProxyService/FetchContent',
+            proxy__pb2.Request.SerializeToString,
+            proxy__pb2.Response.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
-# Opcional: Generar para otros lenguajes
-read -p "¿Quieres generar también archivos para Python? (y/N): " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    PYTHON_OUT="./generated/python"
-    mkdir -p "$PYTHON_OUT"
-    
-    if command -v python3 &> /dev/null && python3 -c "import grpc_tools" &> /dev/null; then
-        echo "Generando archivos Python..."
-        python3 -m grpc_tools.protoc \
-            --proto_path="$PROTO_DIR" \
-            --python_out="$PYTHON_OUT" \
-            --grpc_python_out="$PYTHON_OUT" \
-            "$PROTO_DIR/proxy_service.proto"
-        echo "✅ Archivos Python generados en $PYTHON_OUT"
-    else
-        echo "❌ Python3 o grpc_tools no están disponibles"
-        echo "Instala con: pip install grpcio-tools"
-    fi
-fi
+    @staticmethod
+    def GetRandomProxy(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/proxy.ProxyService/GetRandomProxy',
+            proxy__pb2.ProxyRequest.SerializeToString,
+            proxy__pb2.ProxyResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
-read -p "¿Quieres generar también archivos para JavaScript/TypeScript? (y/N): " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    JS_OUT="./generated/javascript"
-    mkdir -p "$JS_OUT"
-    
-    if command -v npm &> /dev/null; then
-        echo "Generando archivos JavaScript..."
-        protoc \
-            --proto_path="$PROTO_DIR" \
-            --js_out=import_style=commonjs,binary:"$JS_OUT" \
-            --grpc-web_out=import_style=commonjs,mode=grpcwebtext:"$JS_OUT" \
-            "$PROTO_DIR/proxy_service.proto"
-        echo "✅ Archivos JavaScript generados en $JS_OUT"
-    else
-        echo "❌ npm no está disponible"
-    fi
-fi
+    @staticmethod
+    def GetProxyStats(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/proxy.ProxyService/GetProxyStats',
+            proxy__pb2.StatsRequest.SerializeToString,
+            proxy__pb2.StatsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
-echo ""
-echo "=== Generación completada ==="
-echo "Archivos principales generados:"
-echo "  - $OUT_DIR/proxy.pb.go (mensajes Protocol Buffers)"
-echo "  - $OUT_DIR/proxy_grpc.pb.go (servicio gRPC)"
-echo ""
-echo "Para usar estos archivos en tu proyecto Go:"
-echo "  import fetch \"proxy-api/fetch\""
-echo ""
-echo "Para recompilar el proyecto:"
-echo "  go build ./cmd/main.go"
------ [Archivo: go.mod] -----
-module proxy-api
-
-go 1.23.0
-
-toolchain go1.23.12
-
-require (
-	google.golang.org/grpc v1.74.2
-	google.golang.org/protobuf v1.36.7
+----- [Archivo: proxy_pb2.py] -----
+# -*- coding: utf-8 -*-
+# Generated by the protocol buffer compiler.  DO NOT EDIT!
+# NO CHECKED-IN PROTOBUF GENCODE
+# source: proxy.proto
+# Protobuf Python Version: 6.31.1
+"""Generated protocol buffer code."""
+from google.protobuf import descriptor as _descriptor
+from google.protobuf import descriptor_pool as _descriptor_pool
+from google.protobuf import runtime_version as _runtime_version
+from google.protobuf import symbol_database as _symbol_database
+from google.protobuf.internal import builder as _builder
+_runtime_version.ValidateProtobufRuntimeVersion(
+    _runtime_version.Domain.PUBLIC,
+    6,
+    31,
+    1,
+    '',
+    'proxy.proto'
 )
+# @@protoc_insertion_point(imports)
 
-require (
-	golang.org/x/net v0.42.0 // indirect
-	golang.org/x/sys v0.35.0 // indirect
-	golang.org/x/text v0.28.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20250804133106-a7a43d27e69b // indirect
-)
+_sym_db = _symbol_database.Default()
 
------ [Archivo: go.sum] -----
-github.com/go-logr/logr v1.4.3 h1:CjnDlHq8ikf6E492q6eKboGOC0T8CDaOvkHCIg8idEI=
-github.com/go-logr/logr v1.4.3/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=
-github.com/go-logr/stdr v1.2.2 h1:hSWxHoqTgW2S2qGc0LTAI563KZ5YKYRhT3MFKZMbjag=
-github.com/go-logr/stdr v1.2.2/go.mod h1:mMo/vtBO5dYbehREoey6XUKy/eSumjCCveDpRre4VKE=
-github.com/golang/protobuf v1.5.4 h1:i7eJL8qZTpSEXOPTxNKhASYpMn+8e5Q6AdndVa1dWek=
-github.com/golang/protobuf v1.5.4/go.mod h1:lnTiLA8Wa4RWRcIUkrtSVa5nRhsEGBg48fD6rSs7xps=
-github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
-github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
-github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
-github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
-go.opentelemetry.io/auto/sdk v1.1.0 h1:cH53jehLUN6UFLY71z+NDOiNJqDdPRaXzTel0sJySYA=
-go.opentelemetry.io/auto/sdk v1.1.0/go.mod h1:3wSPjt5PWp2RhlCcmmOial7AvC4DQqZb7a7wCow3W8A=
-go.opentelemetry.io/otel v1.36.0 h1:UumtzIklRBY6cI/lllNZlALOF5nNIzJVb16APdvgTXg=
-go.opentelemetry.io/otel v1.36.0/go.mod h1:/TcFMXYjyRNh8khOAO9ybYkqaDBb/70aVwkNML4pP8E=
-go.opentelemetry.io/otel/metric v1.36.0 h1:MoWPKVhQvJ+eeXWHFBOPoBOi20jh6Iq2CcCREuTYufE=
-go.opentelemetry.io/otel/metric v1.36.0/go.mod h1:zC7Ks+yeyJt4xig9DEw9kuUFe5C3zLbVjV2PzT6qzbs=
-go.opentelemetry.io/otel/sdk v1.36.0 h1:b6SYIuLRs88ztox4EyrvRti80uXIFy+Sqzoh9kFULbs=
-go.opentelemetry.io/otel/sdk v1.36.0/go.mod h1:+lC+mTgD+MUWfjJubi2vvXWcVxyr9rmlshZni72pXeY=
-go.opentelemetry.io/otel/sdk/metric v1.36.0 h1:r0ntwwGosWGaa0CrSt8cuNuTcccMXERFwHX4dThiPis=
-go.opentelemetry.io/otel/sdk/metric v1.36.0/go.mod h1:qTNOhFDfKRwX0yXOqJYegL5WRaW376QbB7P4Pb0qva4=
-go.opentelemetry.io/otel/trace v1.36.0 h1:ahxWNuqZjpdiFAyrIoQ4GIiAIhxAunQR6MUoKrsNd4w=
-go.opentelemetry.io/otel/trace v1.36.0/go.mod h1:gQ+OnDZzrybY4k4seLzPAWNwVBBVlF2szhehOBB/tGA=
-golang.org/x/net v0.42.0 h1:jzkYrhi3YQWD6MLBJcsklgQsoAcw89EcZbJw8Z614hs=
-golang.org/x/net v0.42.0/go.mod h1:FF1RA5d3u7nAYA4z2TkclSCKh68eSXtiFwcWQpPXdt8=
-golang.org/x/sys v0.35.0 h1:vz1N37gP5bs89s7He8XuIYXpyY0+QlsKmzipCbUtyxI=
-golang.org/x/sys v0.35.0/go.mod h1:BJP2sWEmIv4KK5OTEluFJCKSidICx8ciO85XgH3Ak8k=
-golang.org/x/text v0.28.0 h1:rhazDwis8INMIwQ4tpjLDzUhx6RlXqZNPEM0huQojng=
-golang.org/x/text v0.28.0/go.mod h1:U8nCwOR8jO/marOQ0QbDiOngZVEBB7MAiitBuMjXiNU=
-google.golang.org/genproto/googleapis/rpc v0.0.0-20250804133106-a7a43d27e69b h1:zPKJod4w6F1+nRGDI9ubnXYhU9NSWoFAijkHkUXeTK8=
-google.golang.org/genproto/googleapis/rpc v0.0.0-20250804133106-a7a43d27e69b/go.mod h1:qQ0YXyHHx3XkvlzUtpXDkS29lDSafHMZBAZDc03LQ3A=
-google.golang.org/grpc v1.74.2 h1:WoosgB65DlWVC9FqI82dGsZhWFNBSLjQ84bjROOpMu4=
-google.golang.org/grpc v1.74.2/go.mod h1:CtQ+BGjaAIXHs/5YS3i473GqwBBa1zGQNevxdeBEXrM=
-google.golang.org/protobuf v1.36.7 h1:IgrO7UwFQGJdRNXH/sQux4R1Dj1WAKcLElzeeRaXV2A=
-google.golang.org/protobuf v1.36.7/go.mod h1:jduwjTPXsFjZGTmRluh+L6NjiWu7pchiJ2/5YcXBHnY=
 
------ [Archivo: internal/config/config.go] -----
-package config
 
-// Tamaño del chunk de proxies
-const DefaultChunkSize = 20
-const DefaultSessionTimeout = 2000 //ms
-const UpdateTime = 30
 
------ [Archivo: internal/config/sessions.go] -----
-package config
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0bproxy.proto\x12\x05proxy\"H\n\x07Request\x12\x0b\n\x03url\x18\x01 \x01(\t\x12\x0f\n\x07session\x18\x02 \x01(\t\x12\r\n\x05proxy\x18\x03 \x01(\x08\x12\x10\n\x08redirect\x18\x04 \x01(\x08\"\x1b\n\x08Response\x12\x0f\n\x07\x63ontent\x18\x01 \x01(\x0c\"\x1f\n\x0cProxyRequest\x12\x0f\n\x07session\x18\x01 \x01(\t\"@\n\rProxyResponse\x12\r\n\x05proxy\x18\x01 \x01(\t\x12\x0f\n\x07success\x18\x02 \x01(\x08\x12\x0f\n\x07message\x18\x03 \x01(\t\"\x0e\n\x0cStatsRequest\"\xb7\x01\n\rStatsResponse\x12M\n\x16proxy_count_by_session\x18\x01 \x03(\x0b\x32-.proxy.StatsResponse.ProxyCountBySessionEntry\x12\x1b\n\x13total_valid_proxies\x18\x02 \x01(\x05\x1a:\n\x18ProxyCountBySessionEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x05:\x02\x38\x01\x32\xb8\x01\n\x0cProxyService\x12/\n\x0c\x46\x65tchContent\x12\x0e.proxy.Request\x1a\x0f.proxy.Response\x12;\n\x0eGetRandomProxy\x12\x13.proxy.ProxyRequest\x1a\x14.proxy.ProxyResponse\x12:\n\rGetProxyStats\x12\x13.proxy.StatsRequest\x1a\x14.proxy.StatsResponseb\x06proto3')
 
-type ProxySession struct {
-	Name    string
-	URL     string
-	Headers map[string]string
-	Timeout int
-}
-
-var ProxySessions = map[string]ProxySession{
-	/*"FlashScore": {
-		Name: "FlashScore",
-		URL:  "https://local-global.flashscore.ninja/2/x/feed/r_1_1",
-		Headers: map[string]string{
-			"Accept-Encoding":    "gzip, deflate, br",
-			"Accept-Language":    "es-ES,es;q=0.9,en;q=0.8,zh-TW;q=0.7,zh;q=0.6,ja;q=0.5,zh-CN;q=0.4",
-			"Origin":             "https://www.flashscore.es",
-			"Referer":            "https://www.flashscore.es/",
-			"Sec-Ch-Ua":          "'Google Chrome';v='117', 'Not;A=Brand';v='8', 'Chromium';v='117'",
-			"Sec-Ch-Ua-Mobile":   "?0",
-			"Sec-Ch-Ua-Platform": "'Windows'",
-			"Sec-Fetch-Dest":     "empty",
-			"Sec-Fetch-Mode":     "cors",
-			"Sec-Fetch-Site":     "cross-site",
-			"X-Fsign":            "SW9D1eZo",
-		},
-		Timeout: DefaultSessionTimeout,
-	}, */
-	"CoinMarketCap": {
-		Name:    "CoinMarketCap",
-		URL:     "https://coinmarketcap.com/es/",
-		Headers: map[string]string{},
-		Timeout: DefaultSessionTimeout,
-	},
-}
-
-func GetHeadersFromSession(session string) map[string]string {
-	return ProxySessions[session].Headers
-}
-
------ [Archivo: internal/proxy/proxy.go] -----
-package proxy
-
-import (
-	"log"
-	"net/http"
-	"net/url"
-	"proxy-api/internal/config"
-	"proxy-api/internal/scraper"
-	"sync"
-	"time"
-)
-
-// Tamaño del chunk, idealmente esto debería venir de un archivo de configuración
-const ChunkSize = config.DefaultChunkSize
-
-// ValidProxies almacena los proxies válidos, con locking para acceso seguro
-var (
-	ValidProxies = make(map[string][]string)
-	mutex        = &sync.Mutex{}
-)
-
-// Procesar un solo test de proxy
-func RunProxyTest(cfg config.ProxySession, proxy string) {
-	proxyURL, err := url.Parse("http://" + proxy)
-	if err != nil {
-		log.Printf("Error al parsear el proxy %s: %v", proxy, err)
-		return
-	}
-
-	httpClient := &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyURL(proxyURL),
-		},
-		Timeout: time.Duration(cfg.Timeout) * time.Millisecond,
-	}
-
-	request, err := http.NewRequest("GET", cfg.URL, nil)
-	if err != nil {
-		log.Printf("Error al crear la solicitud: %v", err)
-		return
-	}
-
-	for headerName, headerValue := range cfg.Headers {
-		request.Header.Set(headerName, headerValue)
-	}
-
-	request.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36")
-
-	resp, err := httpClient.Do(request)
-	if err != nil || (resp != nil && resp.StatusCode != 200) {
-		log.Printf("Proxy %s no válido para %s", proxy, cfg.Name)
-		if resp != nil {
-			resp.Body.Close()
-		}
-		return
-	}
-
-	mutex.Lock()
-	ValidProxies[cfg.Name] = append(ValidProxies[cfg.Name], proxy)
-	mutex.Unlock()
-
-	if resp != nil {
-		resp.Body.Close()
-	}
-}
-
-// Procesar todos los tests en un proxy
-func runAllTests(proxy string) {
-	var wg sync.WaitGroup
-	wg.Add(len(config.ProxySessions))
-
-	for _, test := range config.ProxySessions {
-		go func(test config.ProxySession) {
-			defer wg.Done()
-			RunProxyTest(test, proxy)
-		}(test)
-	}
-
-	wg.Wait()
-}
-
-// Divide los proxies en chunks más manejables
-func chunkProxies(proxies []string) [][]string {
-	var chunks [][]string
-	for i := 0; i < len(proxies); i += ChunkSize {
-		end := i + ChunkSize
-		if end > len(proxies) {
-			end = len(proxies)
-		}
-		chunks = append(chunks, proxies[i:end])
-	}
-	return chunks
-}
-
-// ValidateProxies realiza la validación de la lista de proxies
-func GetValidProxies() map[string][]string {
-	proxies := scraper.ScrapeProxies()
-	chunks := chunkProxies(proxies)
-	var wg sync.WaitGroup
-	var progressMutex sync.Mutex
-	chunksProcessed := 0
-
-	for _, chunk := range chunks {
-		wg.Add(1)
-		go func(chunk []string) {
-			defer wg.Done()
-			for _, proxy := range chunk {
-				runAllTests(proxy)
-			}
-
-			progressMutex.Lock()
-			chunksProcessed++
-			log.Printf("Progreso: %d/%d chunks procesados.", chunksProcessed, len(chunks))
-			progressMutex.Unlock()
-
-		}(chunk)
-	}
-
-	wg.Wait()
-
-	mutex.Lock()
-	defer mutex.Unlock()
-	for site, proxies := range ValidProxies {
-		log.Printf("Sitio web: %s | Proxies: %v", site, len(proxies))
-	}
-
-	return ValidProxies
-}
-
------ [Archivo: internal/scraper/scraper.go] -----
-package scraper
-
-import (
-	"context"
-	"fmt"
-	"io"
-	"net/http"
-	"strings"
-	"time"
-)
-
-type Scraper struct {
-	urls     []string
-	dataType string
-}
-
-func NewScraper(urls []string, dataType string) *Scraper {
-	return &Scraper{
-		urls:     urls,
-		dataType: dataType,
-	}
-}
-
-func (s *Scraper) Scrape(ctx context.Context) []string {
-	resultChan := make(chan []string)
-	errChan := make(chan error)
-
-	for _, url := range s.urls {
-		go s.fetchData(ctx, url, resultChan, errChan)
-	}
-
-	timeout := time.After(25 * time.Second)
-	var results []string
-	for i := 0; i < len(s.urls); i++ {
-		select {
-		case res := <-resultChan:
-			results = append(results, res...)
-		case err := <-errChan:
-			fmt.Printf("Error scraping %s data: %s\n", s.dataType, err)
-		case <-timeout:
-			fmt.Println("Scraping timed out.")
-			return results
-		}
-	}
-	return results
-}
-
-func (s *Scraper) fetchData(ctx context.Context, url string, resultChan chan []string, errChan chan error) {
-	fmt.Printf("Obteniendo %s de %s...\n", s.dataType, url)
-
-	req, _ := http.NewRequest(http.MethodGet, url, nil)
-	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
-	if err != nil {
-		errChan <- err
-		return
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		errChan <- err
-		return
-	}
-
-	lines := strings.Split(string(body), "\n")
-	var validLines []string
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.Count(trimmed, ":") > 1 {
-			trimmed = strings.Split(trimmed, ":")[0] + ":" + strings.Split(trimmed, ":")[1]
-		}
-		if trimmed != "" || (strings.Contains(url, "user-agents") && (!strings.Contains(trimmed, "Android") &&
-			!strings.Contains(trimmed, "iPhone") &&
-			!strings.Contains(trimmed, "iPad") &&
-			!strings.Contains(trimmed, "compatible;"))) {
-
-			validLines = append(validLines, trimmed)
-		}
-	}
-	resultChan <- validLines
-}
-
-func ScrapeProxies() []string {
-	urls := []string{
-		// "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
-		// "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/all/data.txt",
-		"https://raw.githubusercontent.com/officialputuid/KangProxy/refs/heads/KangProxy/https/https.txt",
-		"https://raw.githubusercontent.com/vakhov/fresh-proxy-list/refs/heads/master/https.txt",
-		// "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
-		// "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
-		// "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
-		// "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt",
-		// "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/http.txt",
-	}
-	scraper := NewScraper(urls, "proxies")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return scraper.Scrape(ctx)
-}
-
-func ScrapeUserAgents() []string {
-	urls := []string{
-		"https://gist.githubusercontent.com/pzb/b4b6f57144aea7827ae4/raw/cf847b76a142955b1410c8bcef3aabe221a63db1/user-agents.txt",
-	}
-	scraper := NewScraper(urls, "user-agents")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Número máximo de intentos
-	maxRetries := 3
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		result := scraper.Scrape(ctx)
-		if len(result) > 0 {
-			// Si la operación tiene éxito, retornar los datos
-			return result
-		}
-
-		// Si la operación falla, esperar un momento antes de volver a intentar
-		fmt.Printf("Intento %d fallido. Reintentando...\n", attempt)
-		scraper = NewScraper(urls, "user-agents")
-		time.Sleep(2 * time.Second)
-	}
-
-	// Si todos los intentos fallan, retornar una lista vacía o manejar el error de otra manera.
-	return []string{}
-}
+_globals = globals()
+_builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
+_builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'proxy_pb2', _globals)
+if not _descriptor._USE_C_DESCRIPTORS:
+  DESCRIPTOR._loaded_options = None
+  _globals['_STATSRESPONSE_PROXYCOUNTBYSESSIONENTRY']._loaded_options = None
+  _globals['_STATSRESPONSE_PROXYCOUNTBYSESSIONENTRY']._serialized_options = b'8\001'
+  _globals['_REQUEST']._serialized_start=22
+  _globals['_REQUEST']._serialized_end=94
+  _globals['_RESPONSE']._serialized_start=96
+  _globals['_RESPONSE']._serialized_end=123
+  _globals['_PROXYREQUEST']._serialized_start=125
+  _globals['_PROXYREQUEST']._serialized_end=156
+  _globals['_PROXYRESPONSE']._serialized_start=158
+  _globals['_PROXYRESPONSE']._serialized_end=222
+  _globals['_STATSREQUEST']._serialized_start=224
+  _globals['_STATSREQUEST']._serialized_end=238
+  _globals['_STATSRESPONSE']._serialized_start=241
+  _globals['_STATSRESPONSE']._serialized_end=424
+  _globals['_STATSRESPONSE_PROXYCOUNTBYSESSIONENTRY']._serialized_start=366
+  _globals['_STATSRESPONSE_PROXYCOUNTBYSESSIONENTRY']._serialized_end=424
+  _globals['_PROXYSERVICE']._serialized_start=427
+  _globals['_PROXYSERVICE']._serialized_end=611
+# @@protoc_insertion_point(module_scope)
 
 ----- [Archivo: README.md] -----
-# Instrucciones Avanzadas para el Uso del Proyecto Proxy-API
+## README.md
+# Proxy Server Python con Selenium
 
-## Montaje de la Imagen Docker en Segundo Plano
+Un servidor proxy HTTP/HTTPS implementado en Python que utiliza Selenium para validación de proxies y obtención de contenido web. Este proyecto es una implementación equivalente del proxy server original en Go, pero aprovechando las capacidades de Selenium para mayor compatibilidad con sitios web modernos.
 
-Además del uso de `docker-compose`, puedes construir y ejecutar la imagen Docker manualmente.
+## Características
 
-### Construir la Imagen con Docker Build
+- **Servidor gRPC** con múltiples métodos de servicio
+- **Validación de proxies con Selenium** para mayor precisión
+- **Sistema de sesiones** configurables por sitio web
+- **Scraping automático** de proxies y user agents
+- **Fallback inteligente** entre Selenium y requests
+- **Contenedorización con Docker**
+- **Actualización automática** de proxies en segundo plano
 
-1. **Construye la imagen Docker:**
-   ```sh
-   docker build -t proxy-api .
-   ```
+## Estructura del Proyecto
 
-   Esto creará una imagen Docker llamada `proxy-api` utilizando el `Dockerfile` presente en el proyecto.
+```
+proxy-server-python/
+├── requirements.txt          # Dependencias Python
+├── docker-compose.yml        # Configuración Docker Compose
+├── Dockerfile               # Imagen Docker
+├── main.py                  # Punto de entrada principal
+├── protos/
+│   └── proxy.proto          # Definición del servicio gRPC
+├── api/
+│   └── server.py            # Implementación del servidor gRPC
+├── internal/
+│   ├── config/
+│   │   ├── config.py        # Configuración general
+│   │   └── sessions.py      # Configuración de sesiones
+│   ├── proxy/
+│   │   └── proxy.py         # Validación de proxies con Selenium
+│   └── scraper/
+│       └── scraper.py       # Scraping de proxies y user agents
+└── scripts/
+    ├── generate_proto.sh    # Script para generar archivos proto
+    └── test_client.py       # Cliente de prueba
+```
 
-2. **Ejecutar la imagen en segundo plano:**
-   ```sh
-   docker run -d -p 5000:5000 --name proxy_server proxy-api
-   ```
+## Instalación y Uso
 
-   Este comando ejecutará un contenedor basado en la imagen `proxy-api`, exponiendo el puerto 5000 y ejecutándose en segundo plano.
+### Método 1: Docker Compose (Recomendado)
 
-## Uso de los Archivos Proto en Otros Proyectos
+```bash
+# Clonar y entrar al directorio
+git clone <repository>
+cd proxy-server-python
 
-Para generar los archivos necesarios para utilizar el servicio gRPC en otros proyectos:
+# Ejecutar con Docker Compose
+docker-compose up --build
+```
 
-1. **Ejecuta el script `generateProxyProto.sh`:**
-   ```sh
-   ./generateProxyProto.sh
-   ```
+### Método 2: Instalación Local
 
-   Esto generará los archivos necesarios en los lenguajes especificados (por ejemplo, Go, Python, etc.) a partir del archivo `proto`.
+```bash
+# Instalar dependencias
+pip install -r requirements.txt
 
-2. **Importa los archivos generados en tu proyecto cliente:**
-   Utiliza estos archivos en tu proyecto cliente para interactuar con el servicio gRPC del Proxy-API.
+# Generar archivos gRPC
+chmod +x scripts/generate_proto.sh
+./scripts/generate_proto.sh
 
-## Sesiones y su Uso
+# Ejecutar servidor
+python main.py
+```
 
-Las sesiones en `config.ProxySessions` permiten especificar configuraciones particulares para diferentes destinos web. Cada sesión define un conjunto de encabezados HTTP, una URL y un tiempo de espera. Estas sesiones permiten adaptar las solicitudes a las particularidades de cada recurso web, como diferentes mecanismos de autenticación o requerimientos de encabezados específicos.
+### Método 3: Docker Manual
 
-### Ejemplo de Sesiones
+```bash
+# Construir imagen
+docker build -t proxy-server-python .
 
-```go
-var ProxySessions = map[string]ProxySession{
-	"GoogleTranslateAPI": {
-		Name:    "GoogleTranslateAPI",
-		URL:     "https://translate.googleapis.com/translate_a/single...",
-		Headers: map[string]string{},
-		Timeout: DefaultSessionTimeout,
-	},
-	"GoogleTranslateClient": {
-		Name:    "GoogleTranslateClient",
-		URL:     "https://clients5.google.com/translate_a/t...",
-		Headers: map[string]string{},
-		Timeout: DefaultSessionTimeout,
-	},
+# Ejecutar contenedor
+docker run -d -p 5000:5000 --name proxy_server proxy-server-python
+```
+
+## Uso del Cliente
+
+```python
+import grpc
+import proxy_pb2
+import proxy_pb2_grpc
+
+# Conectar al servidor
+channel = grpc.insecure_channel('localhost:5000')
+stub = proxy_pb2_grpc.ProxyServiceStub(channel)
+
+# Obtener contenido con proxy
+request = proxy_pb2.Request(
+    url="https://httpbin.org/ip",
+    session="TestSession",
+    proxy=True,
+    redirect=True
+)
+response = stub.FetchContent(request)
+print(response.content.decode())
+
+# Obtener proxy aleatorio
+proxy_request = proxy_pb2.ProxyRequest(session="TestSession")
+proxy_response = stub.GetRandomProxy(proxy_request)
+print(f"Proxy: {proxy_response.proxy}")
+
+# Obtener estadísticas
+stats_request = proxy_pb2.StatsRequest()
+stats_response = stub.GetProxyStats(stats_request)
+print(f"Total proxies: {stats_response.total_valid_proxies}")
+```
+
+## Configuración de Sesiones
+
+Las sesiones permiten configurar diferentes parámetros para distintos sitios web:
+
+```python
+PROXY_SESSIONS = {
+    "MiSitio": ProxySession(
+        name="MiSitio",
+        url="https://ejemplo.com/api",
+        headers={
+            "Authorization": "Bearer token",
+            "Accept": "application/json",
+        },
+        timeout=5000,  # milisegundos
+    )
 }
 ```
 
-### Uso en el Servicio gRPC
+## API gRPC
 
-Al realizar una solicitud a través del servicio `FetchContent` de gRPC, puedes especificar una de estas sesiones. El servidor Proxy-API utilizará la configuración de la sesión elegida para personalizar la solicitud HTTP.
+### Métodos Disponibles
 
-#### Ejemplo de Uso de Sesiones en una Solicitud gRPC
+1. **FetchContent**: Obtiene contenido de una URL usando proxies
+2. **GetRandomProxy**: Obtiene un proxy aleatorio válido para una sesión
+3. **GetProxyStats**: Obtiene estadísticas de proxies por sesión
 
-```proto
-message Request {
-    string url = 1; // URL a acceder
-    string session = 2; // Nombre de la sesión a utilizar
-    bool proxy = 3; // Indica si se debe usar un proxy
-    bool redirect = 4; // Permite o impide redirecciones automáticas
-}
+### Mensajes
+
+- `Request`: URL, sesión, usar proxy, permitir redirects
+- `Response`: Contenido en bytes
+- `ProxyRequest`: Sesión
+- `ProxyResponse`: Proxy, éxito, mensaje
+- `StatsRequest`: Vacío
+- `StatsResponse`: Estadísticas por sesión
+
+## Diferencias con la Versión Go
+
+### Ventajas de la Versión Python
+
+- **Selenium WebDriver**: Mejor manejo de JavaScript y sitios modernos
+- **Flexibilidad**: Más fácil de modificar y extender
+- **Ecosistema Python**: Acceso a librerías especializadas
+- **Debugging**: Herramientas de debugging más avanzadas
+
+### Consideraciones de Rendimiento
+
+- **Memoria**: Selenium consume más memoria que requests simples
+- **Velocidad**: Selenium es más lento pero más preciso
+- **Fallback**: Sistema de fallback a requests para mejor rendimiento
+
+## Monitoreo y Logs
+
+El servidor proporciona logs detallados:
+
+```
+2024-01-15 10:30:00 - INFO - Iniciando Proxy Server Python con Selenium
+2024-01-15 10:30:01 - INFO - Servidor gRPC iniciado en [::]:5000
+2024-01-15 10:30:05 - INFO - Validando 150 proxies...
+2024-01-15 10:32:10 - INFO - Validación completada. Total de proxies válidos: 25
 ```
 
-En el campo `session`, incluye el nombre de la sesión deseada, como `GoogleTranslateAPI` o `GoogleTranslateClient`. Esto permitirá que el servicio Proxy-API use las configuraciones específicas de esa sesión al realizar la solicitud.
+## Troubleshooting
 
-## Conclusión
+### Chrome/ChromeDriver Issues
 
-Con estas instrucciones avanzadas, deberías ser capaz de construir y ejecutar el servicio Proxy-API, tanto directamente como a través de Docker, y utilizar sus capacidades en otros proyectos mediante los archivos generados por `generateProxyProto.sh`. Además, puedes aprovechar las sesiones para realizar solicitudes personalizadas a diferentes servicios web.
+```bash
+# Instalar Chrome manualmente
+wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add -
+echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list
+apt-get update && apt-get install -y google-chrome-stable
+```
+
+### Memoria Insuficiente
+
+```bash
+# Aumentar memoria compartida en Docker
+docker run --shm-size=2g -p 5000:5000 proxy-server-python
+```
+
+### Permisos
+
+```bash
+# Dar permisos a scripts
+chmod +x scripts/*.sh
+```
+
+## Contribuir
+
+1. Fork el proyecto
+2. Crear rama feature (`git checkout -b feature/nueva-funcionalidad`)
+3. Commit cambios (`git commit -am 'Agregar nueva funcionalidad'`)
+4. Push a la rama (`git push origin feature/nueva-funcionalidad`)
+5. Crear Pull Request
+
+## Licencia
+
+MIT License - ver archivo LICENSE para detalles.
+----- [Archivo: scripts/generate_proto.sh] -----
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Nos movemos al directorio raíz (uno arriba de scripts/)
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+PROTO_DIR="protos"
+OUT_DIR="."
+
+# Verificar que exista el .proto
+if [ ! -f "${PROTO_DIR}/proxy.proto" ]; then
+  echo "Error: No se encontró ${PROTO_DIR}/proxy.proto"
+  exit 1
+fi
+
+# Generar los bindings de Python
+python -m grpc_tools.protoc \
+  --proto_path="${PROTO_DIR}" \
+  --python_out="${OUT_DIR}" \
+  --grpc_python_out="${OUT_DIR}" \
+  "${PROTO_DIR}/proxy.proto"
+
+echo "✅ Archivos Python generados en ${OUT_DIR}:"
+echo "   - proxy_pb2.py"
+echo "   - proxy_pb2_grpc.py"
+
 ----- [Archivo: script.sh] -----
 #!/usr/bin/env bash
 
@@ -1207,10 +1331,12 @@ EXCLUDE_PATTERNS=(
   "*.so"           # Librerías compartidas
   "venv"           # Entorno virtual de Python
   "dist"           # Carpeta de distribución
+  "proxyserver"      # Archivos de caché de fetch
   "fetch"         # Archivos de caché de fetch
-  "proxyserver"         # Archivos de caché de fetch
   ".gitignore"    # Ignorar archivos de configuración de git
-  "main"
+  "main"          # Archivos de caché de fetch
+  "requirements.txt" # Archivo de dependencias
+  "input"         # Archivo de entrada para SCM
 )
 
 # 1) Truncar o crear el archivo de salida sin preguntar

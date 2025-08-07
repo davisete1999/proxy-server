@@ -1,12 +1,14 @@
-version: "3.8"
-
 services:
-  api:
+  proxy-server:
     build: .
-    container_name: proxy_server
+    container_name: proxy_server_python
     ports:
       - "5000:5000"
     restart: always
+    environment:
+      - DISPLAY=:99
+    volumes:
+      - /dev/shm:/dev/shm
     networks:
       - proxy_network
 
@@ -14,4 +16,3 @@ networks:
   proxy_network:
     driver: bridge
     name: proxy_network
-    

@@ -1,0 +1,8 @@
+grpcio
+grpcio-tools
+selenium
+requests
+webdriver-manager
+protobuf
+pydantic
+python-dotenv

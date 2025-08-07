@@ -1,5 +1,2 @@
-script.sh
+__pycache__/
 proxyserver/
-fetch/proxy_service.pb.go
-.gitignore
-fetch/proxy_service_grpc.pb.go
