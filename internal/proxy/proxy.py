@@ -159,32 +159,31 @@ class ProxyValidator:
         return self.valid_proxies.copy()
     
     def _validate_session(self, proxies: List[str], session_name: str) -> List[str]:
-        """Validar proxies para una sesión específica"""
+        """Validar proxies para una sesión específica, deteniendo en 20 válidos"""
         logger.info(f"Validando {len(proxies)} proxies para sesión {session_name}")
-        
+
         # Dividir en lotes pequeños
         batch_size = 5  # Lotes pequeños para mejor paralelización
         batches = [proxies[i:i+batch_size] for i in range(0, len(proxies), batch_size)]
-        
-        all_valid = []
-        
-        # Procesar lotes en paralelo
-        with ThreadPoolExecutor(max_workers=MAX_CHUNK_WORKERS) as executor:
-            batch_futures = [
-                executor.submit(self._test_proxy_batch, batch, session_name) 
-                for batch in batches
-            ]
-            
-            for i, future in enumerate(as_completed(batch_futures)):
-                try:
-                    valid_batch = future.result()
-                    all_valid.extend(valid_batch)
-                    logger.debug(f"Lote {i+1}/{len(batches)} completado: {len(valid_batch)} válidos")
-                except Exception as e:
-                    logger.debug(f"Error en lote {i+1}: {e}")
-        
-        logger.info(f"Sesión {session_name}: {len(all_valid)} proxies válidos")
-        return all_valid
+        all_valid: List[str] = []
+
+        # Procesar lote a lote y detener al llegar a 20
+        for i, batch in enumerate(batches):
+            valid_batch = self._test_proxy_batch(batch, session_name)
+            all_valid.extend(valid_batch)
+            logger.debug(
+                f"Lote {i+1}/{len(batches)} completado: "
+                f"{len(valid_batch)} válidos, totales {len(all_valid)}"
+            )
+
+            if len(all_valid) >= 20:
+                logger.info(
+                    f"Alcanzados 20 proxies válidos para sesión {session_name}, deteniendo validación"
+                )
+                break
+
+        # Devolver sólo los primeros 20
+        return all_valid[:20]
     
     def close_driver_pool(self):
         """Cerrar pool optimizado"""
