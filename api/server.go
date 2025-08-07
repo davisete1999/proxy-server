@@ -136,6 +136,62 @@ func (s *server) removeSuccesfulProxy(proxyAddr string) {
 	s.mtx.Unlock()
 }
 
+// GetRandomProxy - Nuevo método para obtener un proxy aleatorio de una sesión específica
+func (s *server) GetRandomProxy(ctx context.Context, req *pb.ProxyRequest) (*pb.ProxyResponse, error) {
+	if req.Session == "" {
+		return nil, fmt.Errorf("session cannot be empty")
+	}
+
+	// Verificar si la sesión existe en la configuración
+	if _, exists := config.ProxySessions[req.Session]; !exists {
+		return nil, fmt.Errorf("session '%s' not found in configuration", req.Session)
+	}
+
+	// Verificar si hay proxies válidos para esta sesión
+	proxies, exists := validProxies[req.Session]
+	if !exists || len(proxies) == 0 {
+		return &pb.ProxyResponse{
+			Proxy:   "",
+			Success: false,
+			Message: fmt.Sprintf("no valid proxies available for session '%s'", req.Session),
+		}, nil
+	}
+
+	// Seleccionar un proxy aleatorio
+	randomIndex := rand.Intn(len(proxies))
+	selectedProxy := proxies[randomIndex]
+
+	log.Printf("Selected random proxy for session '%s': %s", req.Session, selectedProxy)
+
+	return &pb.ProxyResponse{
+		Proxy:   selectedProxy,
+		Success: true,
+		Message: fmt.Sprintf("proxy selected successfully for session '%s'", req.Session),
+	}, nil
+}
+
+// GetProxyStats - Método adicional para obtener estadísticas de proxies por sesión
+func (s *server) GetProxyStats(ctx context.Context, req *pb.StatsRequest) (*pb.StatsResponse, error) {
+	stats := make(map[string]int32)
+	
+	for session, proxies := range validProxies {
+		stats[session] = int32(len(proxies))
+	}
+
+	return &pb.StatsResponse{
+		ProxyCountBySession: stats,
+		TotalValidProxies:   int32(getTotalProxyCount()),
+	}, nil
+}
+
+func getTotalProxyCount() int {
+	total := 0
+	for _, proxies := range validProxies {
+		total += len(proxies)
+	}
+	return total
+}
+
 // WITHOUT PROXIES
 func (s *server) Fetch(ctx context.Context, req *pb.Request, userAgent string, redirect bool) (*pb.Response, error) {
 	client, err := s.getHTTPClient("default", redirect, req.Session)
@@ -280,5 +336,4 @@ func StartGRPCServer() {
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}
-
 }
