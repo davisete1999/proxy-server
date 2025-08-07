@@ -82,15 +82,15 @@ func (s *Scraper) fetchData(ctx context.Context, url string, resultChan chan []s
 
 func ScrapeProxies() []string {
 	urls := []string{
-		//"https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
-		"https://raw.githubusercontent.com/saisuiu/Lionkings-Http-Proxys-Proxies/main/free.txt",
-		"https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt",
-		//"https://raw.githubusercontent.com/zloi-user/hideip.me/main/https.txt",
-		//"https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
-		//"https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
-		//"https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
-		//"https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt",
-		//"https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/http.txt",
+		// "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+		// "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/all/data.txt",
+		"https://raw.githubusercontent.com/officialputuid/KangProxy/refs/heads/KangProxy/https/https.txt",
+		"https://raw.githubusercontent.com/vakhov/fresh-proxy-list/refs/heads/master/https.txt",
+		// "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+		// "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+		// "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
+		// "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt",
+		// "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/http.txt",
 	}
 	scraper := NewScraper(urls, "proxies")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

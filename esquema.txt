@@ -6,19 +6,17 @@
 │   ├── server.go
 ├── docker-compose.yml
 ├── script.sh
-├── client
-│   ├── main.go
+├── fix.sh
 ├── go.sum
+├── generateProxyProto.sh
 ├── internal
 │   ├── proxy
 │   │   ├── proxy.go
 │   ├── scraper
 │   │   ├── scraper.go
-│   │   ├── scraper_test.go
 │   ├── config
 │   │   ├── config.go
 │   │   ├── sessions.go
-├── test.py
 ├── cmd
 │   ├── main.go
 
@@ -160,6 +158,62 @@ func (s *server) removeSuccesfulProxy(proxyAddr string) {
 	s.mtx.Lock()
 	delete(s.successfulProxies, proxyAddr)
 	s.mtx.Unlock()
+}
+
+// GetRandomProxy - Nuevo método para obtener un proxy aleatorio de una sesión específica
+func (s *server) GetRandomProxy(ctx context.Context, req *pb.ProxyRequest) (*pb.ProxyResponse, error) {
+	if req.Session == "" {
+		return nil, fmt.Errorf("session cannot be empty")
+	}
+
+	// Verificar si la sesión existe en la configuración
+	if _, exists := config.ProxySessions[req.Session]; !exists {
+		return nil, fmt.Errorf("session '%s' not found in configuration", req.Session)
+	}
+
+	// Verificar si hay proxies válidos para esta sesión
+	proxies, exists := validProxies[req.Session]
+	if !exists || len(proxies) == 0 {
+		return &pb.ProxyResponse{
+			Proxy:   "",
+			Success: false,
+			Message: fmt.Sprintf("no valid proxies available for session '%s'", req.Session),
+		}, nil
+	}
+
+	// Seleccionar un proxy aleatorio
+	randomIndex := rand.Intn(len(proxies))
+	selectedProxy := proxies[randomIndex]
+
+	log.Printf("Selected random proxy for session '%s': %s", req.Session, selectedProxy)
+
+	return &pb.ProxyResponse{
+		Proxy:   selectedProxy,
+		Success: true,
+		Message: fmt.Sprintf("proxy selected successfully for session '%s'", req.Session),
+	}, nil
+}
+
+// GetProxyStats - Método adicional para obtener estadísticas de proxies por sesión
+func (s *server) GetProxyStats(ctx context.Context, req *pb.StatsRequest) (*pb.StatsResponse, error) {
+	stats := make(map[string]int32)
+	
+	for session, proxies := range validProxies {
+		stats[session] = int32(len(proxies))
+	}
+
+	return &pb.StatsResponse{
+		ProxyCountBySession: stats,
+		TotalValidProxies:   int32(getTotalProxyCount()),
+	}, nil
+}
+
+func getTotalProxyCount() int {
+	total := 0
+	for _, proxies := range validProxies {
+		total += len(proxies)
+	}
+	return total
 }
 
 // WITHOUT PROXIES
@@ -306,112 +360,7 @@ func StartGRPCServer() {
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}
-
 }
-
------ [Archivo: client/main.go] -----
-package main
-
-import (
-	"bytes"
-	"compress/gzip"
-	"context"
-	"fmt"
-	"io"
-	"log"
-	fetch "proxy-api/fetch"
-	"sync"
-	"time"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-)
-
-func createClient() (fetch.ProxyServiceClient, *grpc.ClientConn) {
-	conn, err := grpc.Dial(":5000", grpc.WithTransportCredentials(insecure.NewCredentials())) // Conexión sin cifrado para propósitos de ejemplo
-	if err != nil {
-		log.Fatalf("Did not connect: %s", err)
-	}
-	return fetch.NewProxyServiceClient(conn), conn
-}
-
-func DecompressAndConvertToString(data []byte) (string, error) {
-	reader, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return "", err
-	}
-	defer reader.Close()
-
-	decompressedData, err := io.ReadAll(reader)
-	if err != nil {
-		return "", err
-	}
-
-	return string(decompressedData), nil
-}
-
-func main() {
-
-	const numRequests = 500
-	var wg sync.WaitGroup
-	wg.Add(numRequests)
-
-	successfulRequests := 0
-	mutex := &sync.Mutex{}
-
-	startTime := time.Now()
-
-	client, conn := createClient() // Crear un nuevo cliente para cada solicitud
-
-	defer conn.Close()
-	fmt.Println("e")
-	for i := 0; i < numRequests; i++ {
-		go func() {
-			defer wg.Done()
-
-			//var retries int
-
-			var response *fetch.Response
-			var err error
-
-			//for {
-			//response, err = client.FetchContent(context.Background(), &fetch.Request{
-			//	Url:      "https://translate.googleapis.com/translate_a/single?client=gtx&sl=es&tl=en&dt=q&q=Hello",
-			//	Session:  "GoogleTranslate",
-			//	Proxy:    true,
-			//	Redirect: false,
-			//})
-			response, err = client.FetchContent(context.Background(), &fetch.Request{
-				Url:      "https://local-global.flashscore.ninja/2/x/feed/r_1_1",
-				Session:  "FlashScore",
-				Proxy:    false,
-				Redirect: false,
-			})
-
-			/*html, err := DecompressAndConvertToString(response.Content)
-			if err != nil {
-				fmt.Printf("Error: %s\n", err)
-			}*/
-
-			if err == nil && response != nil {
-				fmt.Println(response.Content)
-				mutex.Lock()
-				successfulRequests++
-				mutex.Unlock()
-			} else {
-				fmt.Printf("Error: %s\n", err)
-			}
-		}()
-	}
-
-	wg.Wait()
-	elapsedTime := time.Since(startTime)
-
-	fmt.Printf("Total time for %d requests: %s\n", numRequests, elapsedTime)
-	fmt.Printf("Successful requests: %d\n", successfulRequests)
-	fmt.Printf("Failed requests: %d\n", numRequests-successfulRequests)
-}
-
 ----- [Archivo: cmd/main.go] -----
 package main
 
@@ -500,52 +449,363 @@ EXPOSE 5000
 
 # Ejecuta la aplicación cuando el contenedor se inicia
 CMD ["./main"]
+----- [Archivo: fix.sh] -----
+#!/usr/bin/env bash
+
+# Script para resolver problemas de compatibilidad con gRPC
+set -e
+
+echo "=== Solucionando problemas de compatibilidad gRPC ==="
+
+# Colores para output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Función para imprimir mensajes coloreados
+print_status() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# 1. Verificar que Go está instalado
+if ! command -v go &> /dev/null; then
+    print_error "Go no está instalado. Por favor instálalo desde https://golang.org/"
+    exit 1
+fi
+
+print_status "Go versión: $(go version)"
+
+# 2. Limpiar módulos y caché
+print_status "Limpiando caché de módulos Go..."
+go clean -modcache
+go mod tidy
+
+# 3. Actualizar dependencias
+print_status "Actualizando dependencias..."
+go get -u google.golang.org/grpc@latest
+go get -u google.golang.org/protobuf@latest
+go mod tidy
+
+# 4. Instalar/actualizar herramientas de protoc
+print_status "Instalando herramientas de Protocol Buffers..."
+
+# Verificar si protoc está instalado
+if ! command -v protoc &> /dev/null; then
+    print_error "protoc no está instalado."
+    echo "Por favor instálalo:"
+    echo "  - Ubuntu/Debian: sudo apt install protobuf-compiler"
+    echo "  - macOS: brew install protobuf"
+    echo "  - Windows: Descarga desde https://github.com/protocolbuffers/protobuf/releases"
+    exit 1
+fi
+
+print_status "protoc versión: $(protoc --version)"
+
+# Instalar plugins de Go para protoc
+print_status "Instalando plugins de protoc para Go..."
+go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+
+# Verificar que los plugins están en el PATH
+if ! command -v protoc-gen-go &> /dev/null; then
+    print_warning "protoc-gen-go no está en el PATH"
+    echo "Asegúrate de que \$GOPATH/bin está en tu PATH:"
+    echo "export PATH=\$PATH:\$(go env GOPATH)/bin"
+fi
+
+if ! command -v protoc-gen-go-grpc &> /dev/null; then
+    print_warning "protoc-gen-go-grpc no está en el PATH"
+    echo "Asegúrate de que \$GOPATH/bin está en tu PATH:"
+    echo "export PATH=\$PATH:\$(go env GOPATH)/bin"
+fi
+
+# 5. Crear directorio fetch si no existe
+mkdir -p fetch
+
+# 6. Crear archivo proto actualizado
+print_status "Creando archivo proto actualizado..."
+cat > fetch/proxy.proto << 'EOF'
+syntax = "proto3";
+
+package fetch;
+
+option go_package = "proxy-api/fetch";
+
+// Servicio principal de proxy
+service ProxyService {
+    // Método existente para obtener contenido
+    rpc FetchContent(Request) returns (Response);
+    
+    // Nuevo método para obtener un proxy aleatorio
+    rpc GetRandomProxy(ProxyRequest) returns (ProxyResponse);
+    
+    // Método adicional para obtener estadísticas de proxies
+    rpc GetProxyStats(StatsRequest) returns (StatsResponse);
+}
+
+// Mensaje de solicitud existente
+message Request {
+    string url = 1;
+    string session = 2;
+    bool proxy = 3;
+    bool redirect = 4;
+}
+
+// Mensaje de respuesta existente
+message Response {
+    bytes content = 1;
+}
+
+// Nuevo mensaje para solicitar un proxy aleatorio
+message ProxyRequest {
+    string session = 1; // Sesión para la cual obtener el proxy
+}
+
+// Nuevo mensaje de respuesta para proxy aleatorio
+message ProxyResponse {
+    string proxy = 1;   // Dirección del proxy (ip:port)
+    bool success = 2;   // Indica si la operación fue exitosa
+    string message = 3; // Mensaje descriptivo del resultado
+}
+
+// Mensaje para solicitar estadísticas
+message StatsRequest {
+    // Vacío por ahora, podría expandirse en el futuro
+}
+
+// Mensaje de respuesta con estadísticas
+message StatsResponse {
+    map<string, int32> proxy_count_by_session = 1; // Cantidad de proxies por sesión
+    int32 total_valid_proxies = 2;                 // Total de proxies válidos
+}
+EOF
+
+# 7. Eliminar archivos proto generados anteriormente
+print_status "Eliminando archivos proto generados anteriormente..."
+rm -f fetch/*.pb.go
+
+# 8. Generar nuevos archivos proto
+print_status "Generando archivos proto..."
+protoc \
+    --proto_path=fetch \
+    --go_out=fetch \
+    --go_opt=paths=source_relative \
+    --go-grpc_out=fetch \
+    --go-grpc_opt=paths=source_relative \
+    fetch/proxy.proto
+
+# 9. Verificar que los archivos se generaron correctamente
+if [ -f "fetch/proxy.pb.go" ] && [ -f "fetch/proxy_grpc.pb.go" ]; then
+    print_status "✅ Archivos proto generados exitosamente"
+else
+    print_error "❌ Error generando archivos proto"
+    exit 1
+fi
+
+# 10. Intentar compilar el proyecto
+print_status "Verificando compilación del proyecto..."
+if go build ./cmd/main.go; then
+    print_status "✅ Proyecto compilado exitosamente"
+    rm -f main # Limpiar binario de prueba
+else
+    print_error "❌ Error compilando el proyecto"
+    echo "Revisa los errores anteriores e intenta de nuevo"
+    exit 1
+fi
+
+# 11. Mostrar información de las dependencias
+print_status "Información de dependencias actuales:"
+go list -m all | grep -E "(grpc|protobuf)"
+
+echo ""
+print_status "🎉 ¡Problema resuelto! El proyecto debería compilar correctamente ahora."
+echo ""
+echo "Próximos pasos:"
+echo "1. go build ./cmd/main.go"
+echo "2. ./main"
+echo "3. go run client/main.go (en otra terminal)"
+----- [Archivo: generateProxyProto.sh] -----
+#!/usr/bin/env bash
+
+# Script para generar archivos gRPC desde el archivo proto
+# Asegúrate de tener instalados:
+# - protoc (Protocol Buffers compiler)
+# - protoc-gen-go (Go plugin para protoc)
+# - protoc-gen-go-grpc (gRPC Go plugin)
+
+set -e
+
+echo "=== Generando archivos gRPC desde proxy_service.proto ==="
+
+# Directorio donde está el archivo proto
+PROTO_DIR="fetch/"
+# Directorio de salida para los archivos generados
+OUT_DIR="fetch/"
+
+# Crear directorio de salida si no existe
+mkdir -p "$OUT_DIR"
+
+# Verificar que existe el archivo proto
+if [ ! -f "$PROTO_DIR/proxy_service.proto" ]; then
+    echo "Error: No se encontró el archivo proxy_service.proto en $PROTO_DIR"
+    echo "Por favor asegúrate de que el archivo proto existe."
+    exit 1
+fi
+
+# Verificar que protoc está instalado
+if ! command -v protoc &> /dev/null; then
+    echo "Error: protoc no está instalado."
+    echo "Instálalo desde: https://grpc.io/docs/protoc-installation/"
+    exit 1
+fi
+
+# Verificar que los plugins de Go están instalados
+if ! command -v protoc-gen-go &> /dev/null; then
+    echo "Error: protoc-gen-go no está instalado."
+    echo "Instálalo con: go install google.golang.org/protobuf/cmd/protoc-gen-go@latest"
+    exit 1
+fi
+
+if ! command -v protoc-gen-go-grpc &> /dev/null; then
+    echo "Error: protoc-gen-go-grpc no está instalado."
+    echo "Instálalo con: go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest"
+    exit 1
+fi
+
+echo "Generando archivos Go desde proxy_service.proto..."
+
+# Generar archivos Go
+protoc \
+    --proto_path="$PROTO_DIR" \
+    --go_out="$OUT_DIR" \
+    --go_opt=paths=source_relative \
+    --go-grpc_out="$OUT_DIR" \
+    --go-grpc_opt=paths=source_relative \
+    "$PROTO_DIR/proxy_service.proto"
+
+echo "✅ Archivos Go generados exitosamente en $OUT_DIR"
+
+# Opcional: Generar para otros lenguajes
+read -p "¿Quieres generar también archivos para Python? (y/N): " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    PYTHON_OUT="./generated/python"
+    mkdir -p "$PYTHON_OUT"
+    
+    if command -v python3 &> /dev/null && python3 -c "import grpc_tools" &> /dev/null; then
+        echo "Generando archivos Python..."
+        python3 -m grpc_tools.protoc \
+            --proto_path="$PROTO_DIR" \
+            --python_out="$PYTHON_OUT" \
+            --grpc_python_out="$PYTHON_OUT" \
+            "$PROTO_DIR/proxy_service.proto"
+        echo "✅ Archivos Python generados en $PYTHON_OUT"
+    else
+        echo "❌ Python3 o grpc_tools no están disponibles"
+        echo "Instala con: pip install grpcio-tools"
+    fi
+fi
+
+read -p "¿Quieres generar también archivos para JavaScript/TypeScript? (y/N): " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    JS_OUT="./generated/javascript"
+    mkdir -p "$JS_OUT"
+    
+    if command -v npm &> /dev/null; then
+        echo "Generando archivos JavaScript..."
+        protoc \
+            --proto_path="$PROTO_DIR" \
+            --js_out=import_style=commonjs,binary:"$JS_OUT" \
+            --grpc-web_out=import_style=commonjs,mode=grpcwebtext:"$JS_OUT" \
+            "$PROTO_DIR/proxy_service.proto"
+        echo "✅ Archivos JavaScript generados en $JS_OUT"
+    else
+        echo "❌ npm no está disponible"
+    fi
+fi
+
+echo ""
+echo "=== Generación completada ==="
+echo "Archivos principales generados:"
+echo "  - $OUT_DIR/proxy.pb.go (mensajes Protocol Buffers)"
+echo "  - $OUT_DIR/proxy_grpc.pb.go (servicio gRPC)"
+echo ""
+echo "Para usar estos archivos en tu proyecto Go:"
+echo "  import fetch \"proxy-api/fetch\""
+echo ""
+echo "Para recompilar el proyecto:"
+echo "  go build ./cmd/main.go"
 ----- [Archivo: go.mod] -----
 module proxy-api
 
-go 1.18
+go 1.23.0
+
+toolchain go1.23.12
 
 require (
-	google.golang.org/grpc v1.59.0
-	google.golang.org/protobuf v1.31.0
+	google.golang.org/grpc v1.74.2
+	google.golang.org/protobuf v1.36.7
 )
 
 require (
-	github.com/golang/protobuf v1.5.3 // indirect
-	golang.org/x/net v0.15.0 // indirect
-	golang.org/x/sys v0.12.0 // indirect
-	golang.org/x/text v0.13.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20230822172742-b8732ec3820d // indirect
+	golang.org/x/net v0.42.0 // indirect
+	golang.org/x/sys v0.35.0 // indirect
+	golang.org/x/text v0.28.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20250804133106-a7a43d27e69b // indirect
 )
 
 ----- [Archivo: go.sum] -----
-github.com/golang/protobuf v1.5.0/go.mod h1:FsONVRAS9T7sI+LIUmWTfcYkHO4aIWwzhcaSAoJOfIk=
-github.com/golang/protobuf v1.5.3 h1:KhyjKVUg7Usr/dYsdSqoFveMYd5ko72D+zANwlG1mmg=
-github.com/golang/protobuf v1.5.3/go.mod h1:XVQd3VNwM+JqD3oG2Ue2ip4fOMUkwXdXDdiuN0vRsmY=
-github.com/google/go-cmp v0.5.5/go.mod h1:v8dTdLbMG2kIc/vJvl+f65V22dbkXbowE6jgT/gNBxE=
-github.com/google/go-cmp v0.5.9 h1:O2Tfq5qg4qc4AmwVlvv0oLiVAGB7enBSJ2x2DqQFi38=
-golang.org/x/net v0.15.0 h1:ugBLEUaxABaB5AJqW9enI0ACdci2RUd4eP51NTBvuJ8=
-golang.org/x/net v0.15.0/go.mod h1:idbUs1IY1+zTqbi8yxTbhexhEEk5ur9LInksu6HrEpk=
-golang.org/x/sys v0.12.0 h1:CM0HF96J0hcLAwsHPJZjfdNzs0gftsLfgKt57wWHJ0o=
-golang.org/x/sys v0.12.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
-golang.org/x/text v0.13.0 h1:ablQoSUd0tRdKxZewP80B+BaqeKJuVhuRxj/dkrun3k=
-golang.org/x/text v0.13.0/go.mod h1:TvPlkZtksWOMsz7fbANvkp4WM8x/WCo/om8BMLbz+aE=
-golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
-google.golang.org/genproto/googleapis/rpc v0.0.0-20230822172742-b8732ec3820d h1:uvYuEyMHKNt+lT4K3bN6fGswmK8qSvcreM3BwjDh+y4=
-google.golang.org/genproto/googleapis/rpc v0.0.0-20230822172742-b8732ec3820d/go.mod h1:+Bk1OCOj40wS2hwAMA+aCW9ypzm63QTBBHp6lQ3p+9M=
-google.golang.org/grpc v1.59.0 h1:Z5Iec2pjwb+LEOqzpB2MR12/eKFhDPhuqW91O+4bwUk=
-google.golang.org/grpc v1.59.0/go.mod h1:aUPDwccQo6OTjy7Hct4AfBPD1GptF4fyUjIkQ9YtF98=
-google.golang.org/protobuf v1.26.0-rc.1/go.mod h1:jlhhOSvTdKEhbULTjvd4ARK9grFBp09yW+WbY/TyQbw=
-google.golang.org/protobuf v1.26.0/go.mod h1:9q0QmTI4eRPtz6boOQmLYwt+qCgq0jsYwAQnmE0givc=
-google.golang.org/protobuf v1.31.0 h1:g0LDEJHgrBl9N9r17Ru3sqWhkIx2NB67okBHPwC7hs8=
-google.golang.org/protobuf v1.31.0/go.mod h1:HV8QOd/L58Z+nl8r43ehVNZIU/HEI6OcFqwMG9pJV4I=
+github.com/go-logr/logr v1.4.3 h1:CjnDlHq8ikf6E492q6eKboGOC0T8CDaOvkHCIg8idEI=
+github.com/go-logr/logr v1.4.3/go.mod h1:9T104GzyrTigFIr8wt5mBrctHMim0Nb2HLGrmQ40KvY=
+github.com/go-logr/stdr v1.2.2 h1:hSWxHoqTgW2S2qGc0LTAI563KZ5YKYRhT3MFKZMbjag=
+github.com/go-logr/stdr v1.2.2/go.mod h1:mMo/vtBO5dYbehREoey6XUKy/eSumjCCveDpRre4VKE=
+github.com/golang/protobuf v1.5.4 h1:i7eJL8qZTpSEXOPTxNKhASYpMn+8e5Q6AdndVa1dWek=
+github.com/golang/protobuf v1.5.4/go.mod h1:lnTiLA8Wa4RWRcIUkrtSVa5nRhsEGBg48fD6rSs7xps=
+github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
+github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
+github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
+github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+go.opentelemetry.io/auto/sdk v1.1.0 h1:cH53jehLUN6UFLY71z+NDOiNJqDdPRaXzTel0sJySYA=
+go.opentelemetry.io/auto/sdk v1.1.0/go.mod h1:3wSPjt5PWp2RhlCcmmOial7AvC4DQqZb7a7wCow3W8A=
+go.opentelemetry.io/otel v1.36.0 h1:UumtzIklRBY6cI/lllNZlALOF5nNIzJVb16APdvgTXg=
+go.opentelemetry.io/otel v1.36.0/go.mod h1:/TcFMXYjyRNh8khOAO9ybYkqaDBb/70aVwkNML4pP8E=
+go.opentelemetry.io/otel/metric v1.36.0 h1:MoWPKVhQvJ+eeXWHFBOPoBOi20jh6Iq2CcCREuTYufE=
+go.opentelemetry.io/otel/metric v1.36.0/go.mod h1:zC7Ks+yeyJt4xig9DEw9kuUFe5C3zLbVjV2PzT6qzbs=
+go.opentelemetry.io/otel/sdk v1.36.0 h1:b6SYIuLRs88ztox4EyrvRti80uXIFy+Sqzoh9kFULbs=
+go.opentelemetry.io/otel/sdk v1.36.0/go.mod h1:+lC+mTgD+MUWfjJubi2vvXWcVxyr9rmlshZni72pXeY=
+go.opentelemetry.io/otel/sdk/metric v1.36.0 h1:r0ntwwGosWGaa0CrSt8cuNuTcccMXERFwHX4dThiPis=
+go.opentelemetry.io/otel/sdk/metric v1.36.0/go.mod h1:qTNOhFDfKRwX0yXOqJYegL5WRaW376QbB7P4Pb0qva4=
+go.opentelemetry.io/otel/trace v1.36.0 h1:ahxWNuqZjpdiFAyrIoQ4GIiAIhxAunQR6MUoKrsNd4w=
+go.opentelemetry.io/otel/trace v1.36.0/go.mod h1:gQ+OnDZzrybY4k4seLzPAWNwVBBVlF2szhehOBB/tGA=
+golang.org/x/net v0.42.0 h1:jzkYrhi3YQWD6MLBJcsklgQsoAcw89EcZbJw8Z614hs=
+golang.org/x/net v0.42.0/go.mod h1:FF1RA5d3u7nAYA4z2TkclSCKh68eSXtiFwcWQpPXdt8=
+golang.org/x/sys v0.35.0 h1:vz1N37gP5bs89s7He8XuIYXpyY0+QlsKmzipCbUtyxI=
+golang.org/x/sys v0.35.0/go.mod h1:BJP2sWEmIv4KK5OTEluFJCKSidICx8ciO85XgH3Ak8k=
+golang.org/x/text v0.28.0 h1:rhazDwis8INMIwQ4tpjLDzUhx6RlXqZNPEM0huQojng=
+golang.org/x/text v0.28.0/go.mod h1:U8nCwOR8jO/marOQ0QbDiOngZVEBB7MAiitBuMjXiNU=
+google.golang.org/genproto/googleapis/rpc v0.0.0-20250804133106-a7a43d27e69b h1:zPKJod4w6F1+nRGDI9ubnXYhU9NSWoFAijkHkUXeTK8=
+google.golang.org/genproto/googleapis/rpc v0.0.0-20250804133106-a7a43d27e69b/go.mod h1:qQ0YXyHHx3XkvlzUtpXDkS29lDSafHMZBAZDc03LQ3A=
+google.golang.org/grpc v1.74.2 h1:WoosgB65DlWVC9FqI82dGsZhWFNBSLjQ84bjROOpMu4=
+google.golang.org/grpc v1.74.2/go.mod h1:CtQ+BGjaAIXHs/5YS3i473GqwBBa1zGQNevxdeBEXrM=
+google.golang.org/protobuf v1.36.7 h1:IgrO7UwFQGJdRNXH/sQux4R1Dj1WAKcLElzeeRaXV2A=
+google.golang.org/protobuf v1.36.7/go.mod h1:jduwjTPXsFjZGTmRluh+L6NjiWu7pchiJ2/5YcXBHnY=
 
 ----- [Archivo: internal/config/config.go] -----
 package config
 
 // Tamaño del chunk de proxies
 const DefaultChunkSize = 20
-const DefaultSessionTimeout = 1000 //ms
+const DefaultSessionTimeout = 2000 //ms
 const UpdateTime = 30
 
 ----- [Archivo: internal/config/sessions.go] -----
@@ -577,15 +837,9 @@ var ProxySessions = map[string]ProxySession{
 		},
 		Timeout: DefaultSessionTimeout,
 	}, */
-	"GoogleTranslateAPI": {
-		Name:    "GoogleTranslateAPI",
-		URL:     "https://translate.googleapis.com/translate_a/single?client=gtx&sl=es&tl=en&dt=q&q=Hello",
-		Headers: map[string]string{},
-		Timeout: DefaultSessionTimeout,
-	},
-	"GoogleTranslateClient": {
-		Name:    "GoogleTranslateClient",
-		URL:     "https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=es&tl=en&q=Hello",
+	"CoinMarketCap": {
+		Name:    "CoinMarketCap",
+		URL:     "https://coinmarketcap.com/es/",
 		Headers: map[string]string{},
 		Timeout: DefaultSessionTimeout,
 	},
@@ -810,15 +1064,15 @@ func (s *Scraper) fetchData(ctx context.Context, url string, resultChan chan []s
 
 func ScrapeProxies() []string {
 	urls := []string{
-		//"https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
-		"https://raw.githubusercontent.com/saisuiu/Lionkings-Http-Proxys-Proxies/main/free.txt",
-		"https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt",
-		//"https://raw.githubusercontent.com/zloi-user/hideip.me/main/https.txt",
-		//"https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
-		//"https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
-		//"https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
-		//"https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt",
-		//"https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/http.txt",
+		// "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+		// "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/all/data.txt",
+		"https://raw.githubusercontent.com/officialputuid/KangProxy/refs/heads/KangProxy/https/https.txt",
+		"https://raw.githubusercontent.com/vakhov/fresh-proxy-list/refs/heads/master/https.txt",
+		// "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+		// "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+		// "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
+		// "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt",
+		// "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/http.txt",
 	}
 	scraper := NewScraper(urls, "proxies")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -852,27 +1106,6 @@ func ScrapeUserAgents() []string {
 
 	// Si todos los intentos fallan, retornar una lista vacía o manejar el error de otra manera.
 	return []string{}
-}
-
------ [Archivo: internal/scraper/scraper_test.go] -----
-package scraper
-
-import (
-	"testing"
-)
-
-func TestScrapeProxies(t *testing.T) {
-	// Usamos una URL de ejemplo que sabemos que debería devolver proxies
-	proxies := ScrapeProxies()
-	userAgents := ScrapeUserAgents()
-
-	if len(proxies) == 0 {
-		t.Errorf("La lista de proxies está vacía")
-	}
-
-	if len(userAgents) == 0 {
-		t.Errorf("La lista de user agents está vacía")
-	}
 }
 
 ----- [Archivo: README.md] -----
@@ -975,7 +1208,9 @@ EXCLUDE_PATTERNS=(
   "venv"           # Entorno virtual de Python
   "dist"           # Carpeta de distribución
   "fetch"         # Archivos de caché de fetch
+  "proxyserver"         # Archivos de caché de fetch
   ".gitignore"    # Ignorar archivos de configuración de git
+  "main"
 )
 
 # 1) Truncar o crear el archivo de salida sin preguntar
@@ -1011,42 +1246,4 @@ while IFS= read -r file; do
   fi
   echo >> "$OUTPUT"
 done
-
------ [Archivo: test.py] -----
-import aiohttp
-import asyncio
-import matplotlib.pyplot as plt
-
-URL = "http://192.168.200.9:5000/getContent?session=FlashScore&url=https://local-spanish.flashscore.ninja/13/x/feed/tr_2_5733_6edGepjk_33_0_2_es_1"
-NUM_REQUESTS = 1
-
-async def fetch_content(session):
-    try:
-        async with session.get(URL) as response:
-            if response.status == 200 and await response.text():
-                return True  # Devolvió contenido
-        return False  # No devolvió contenido
-    except:
-        return False  # Error en la petición
-
-async def main():
-    async with aiohttp.ClientSession() as session:
-        tasks = [fetch_content(session) for _ in range(NUM_REQUESTS)]
-        results = await asyncio.gather(*tasks)
-        successful_requests = sum(1 for result in results if result)
-        unsuccessful_requests = NUM_REQUESTS - successful_requests
-
-        print(f"Peticiones exitosas: {successful_requests}")
-        print(f"Peticiones sin éxito: {unsuccessful_requests}")
-
-        # Representación gráfica
-        labels = ["Exitosas", "Sin éxito"]
-        counts = [successful_requests, unsuccessful_requests]
-        plt.bar(labels, counts, color=['green', 'red'])
-        plt.title("Resultado de 1000 peticiones")
-        plt.ylabel("Número de peticiones")
-        plt.show()
-
-if __name__ == "__main__":
-    asyncio.run(main())
 

@@ -26,15 +26,9 @@ var ProxySessions = map[string]ProxySession{
 		},
 		Timeout: DefaultSessionTimeout,
 	}, */
-	"GoogleTranslateAPI": {
-		Name:    "GoogleTranslateAPI",
-		URL:     "https://translate.googleapis.com/translate_a/single?client=gtx&sl=es&tl=en&dt=q&q=Hello",
-		Headers: map[string]string{},
-		Timeout: DefaultSessionTimeout,
-	},
-	"GoogleTranslateClient": {
-		Name:    "GoogleTranslateClient",
-		URL:     "https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=es&tl=en&q=Hello",
+	"CoinMarketCap": {
+		Name:    "CoinMarketCap",
+		URL:     "https://coinmarketcap.com/es/",
 		Headers: map[string]string{},
 		Timeout: DefaultSessionTimeout,
 	},
