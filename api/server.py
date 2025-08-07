@@ -1,5 +1,6 @@
 """
 Servidor gRPC para el proxy service con pool de drivers
+ACTUALIZADO: Límites de mensaje aumentados para respuestas grandes
 """
 import grpc
 from concurrent import futures
@@ -20,6 +21,13 @@ from internal.proxy.driver_pool import DriverPool
 from internal.scraper.scraper import scrape_user_agents
 
 logger = logging.getLogger(__name__)
+
+# Configuración de límites de mensaje gRPC (50MB)
+MAX_MESSAGE_SIZE = 50 * 1024 * 1024
+GRPC_OPTIONS = [
+    ('grpc.max_send_message_length', MAX_MESSAGE_SIZE),
+    ('grpc.max_receive_message_length', MAX_MESSAGE_SIZE),
+]
 
 class ProxyServicer(proxy_pb2_grpc.ProxyServiceServicer):
     def __init__(self, max_drivers: int = 10):
@@ -314,18 +322,21 @@ class ProxyServicer(proxy_pb2_grpc.ProxyServiceServicer):
         self.proxy_validator.close_driver_pool()
 
 def start_grpc_server():
-    """Iniciar el servidor gRPC"""
+    """Iniciar el servidor gRPC con límites de mensaje aumentados"""
     logger.info("Iniciando servidor gRPC en puerto 5000")
     
     servicer = ProxyServicer(max_drivers=10)
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=10),
+        options=GRPC_OPTIONS  # Límites de mensaje aumentados
+    )
     proxy_pb2_grpc.add_ProxyServiceServicer_to_server(servicer, server)
     
     listen_addr = '[::]:5000'
     server.add_insecure_port(listen_addr)
     
     server.start()
-    logger.info(f"Servidor gRPC iniciado en {listen_addr}")
+    logger.info(f"Servidor gRPC iniciado en {listen_addr} (límite: {MAX_MESSAGE_SIZE/1024/1024:.0f}MB)")
     
     try:
         server.wait_for_termination()

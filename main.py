@@ -1,12 +1,13 @@
 """
 Punto de entrada principal del proxy server con pool de drivers
+ACTUALIZADO: Límites de mensaje gRPC aumentados
 """
 import logging
 import threading
 import time
 import signal
 import sys
-from api.server import start_grpc_server
+from api.server import start_grpc_server, GRPC_OPTIONS, MAX_MESSAGE_SIZE
 from internal.proxy.proxy import ProxyValidator
 from internal.config.config import UPDATE_TIME_MINUTES
 
@@ -42,8 +43,11 @@ def reload_proxies_background():
             logger.info(f"Proxies válidos refrescados: {total_proxies}")
             
             # Mostrar estadísticas del pool
-            pool_stats = proxy_validator.get_driver_pool_stats()
-            logger.info(f"Estadísticas del pool de validación: {pool_stats}")
+            try:
+                pool_stats = proxy_validator.driver_pool.get_stats()
+                logger.info(f"Estadísticas del pool de validación: {pool_stats}")
+            except AttributeError:
+                logger.debug("Driver pool stats no disponibles")
             
         except Exception as e:
             logger.error(f"Error recargando proxies: {e}")
@@ -52,7 +56,7 @@ def reload_proxies_background():
             proxy_validator.close_driver_pool()
 
 def start_grpc_server_wrapper():
-    """Wrapper para el servidor gRPC que permite acceso al servicer"""
+    """Wrapper para el servidor gRPC que permite acceso al servicer con límites aumentados"""
     global current_servicer
     
     logger.info("Iniciando servidor gRPC en puerto 5000")
@@ -63,7 +67,13 @@ def start_grpc_server_wrapper():
     from concurrent import futures
     
     current_servicer = ProxyServicer(max_drivers=10)
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    
+    # Crear servidor con opciones de límite de mensaje
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=10),
+        options=GRPC_OPTIONS  # Límites de mensaje aumentados
+    )
+    
     proxy_pb2_grpc.add_ProxyServiceServicer_to_server(current_servicer, server)
     
     listen_addr = '[::]:5000'
@@ -71,6 +81,7 @@ def start_grpc_server_wrapper():
     
     server.start()
     logger.info(f"Servidor gRPC iniciado en {listen_addr}")
+    logger.info(f"Límite de mensaje configurado: {MAX_MESSAGE_SIZE/1024/1024:.0f}MB")
     
     try:
         server.wait_for_termination()
@@ -82,6 +93,7 @@ def start_grpc_server_wrapper():
 def main():
     """Función principal"""
     logger.info("Iniciando Proxy Server Python con Pool de Drivers")
+    logger.info(f"Límite de mensaje gRPC: {MAX_MESSAGE_SIZE/1024/1024:.0f}MB")
     
     # Configurar manejo de señales
     signal.signal(signal.SIGINT, signal_handler)
