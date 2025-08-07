@@ -68,6 +68,53 @@ class DriverPool:
             options.add_argument(f'--proxy-server=http://{proxy_addr}')
         
         return options
+
+    def _get_chrome_options_optimized(self, proxy_addr: Optional[str] = None) -> Options:
+        """Opciones de Chrome optimizadas para velocidad"""
+        options = Options()
+        
+        # Optimizaciones básicas
+        options.add_argument('--headless')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+        
+        # Optimizaciones de velocidad
+        options.add_argument('--disable-extensions')
+        options.add_argument('--disable-plugins')
+        options.add_argument('--disable-images')  # No cargar imágenes
+        options.add_argument('--disable-javascript')  # No ejecutar JS para test básico
+        options.add_argument('--disable-css')  # No procesar CSS
+        options.add_argument('--disable-web-security')
+        options.add_argument('--disable-features=VizDisplayCompositor')
+        options.add_argument('--disable-ipc-flooding-protection')
+        options.add_argument('--disable-renderer-backgrounding')
+        options.add_argument('--disable-backgrounding-occluded-windows')
+        options.add_argument('--disable-client-side-phishing-detection')
+        options.add_argument('--disable-sync')
+        options.add_argument('--disable-translate')
+        options.add_argument('--disable-default-apps')
+        options.add_argument('--disable-popup-blocking')
+        options.add_argument('--disable-zero-browsers-open-for-tests')
+        options.add_argument('--disable-hang-monitor')
+        options.add_argument('--disable-prompt-on-repost')
+        options.add_argument('--disable-domain-reliability')
+        options.add_argument('--disable-component-update')
+        
+        # Configuraciones de red
+        options.add_argument('--aggressive-cache-discard')
+        options.add_argument('--memory-pressure-off')
+        options.add_argument('--max-connections-per-host=2')
+        
+        # Ventana mínima
+        options.add_argument('--window-size=800,600')
+        
+        # Proxy configuration
+        if proxy_addr:
+            options.add_argument(f'--proxy-server=http://{proxy_addr}')
+            options.add_argument('--proxy-bypass-list=<-loopback>')
+        
+        return options
     
     def _create_driver(self, proxy_addr: Optional[str] = None) -> Optional[webdriver.Chrome]:
         """Crear un nuevo driver"""

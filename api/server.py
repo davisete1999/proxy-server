@@ -136,6 +136,46 @@ class ProxyServicer(proxy_pb2_grpc.ProxyServiceServicer):
         
         response.raise_for_status()
         return response.content
+
+    def _select_best_proxy(self, session_name: str):
+        """Seleccionar el mejor proxy basado en estadísticas de éxito"""
+        proxies = self.valid_proxies.get(session_name, [])
+        if not proxies:
+            return None
+        
+        # Si tenemos estadísticas de éxito, usar el mejor
+        if hasattr(self, 'proxy_success_rates'):
+            # Ordenar por tasa de éxito
+            sorted_proxies = sorted(
+                proxies, 
+                key=lambda p: self.proxy_success_rates.get(p, 0.5), 
+                reverse=True
+            )
+            return sorted_proxies[0]
+        
+        # Fallback: proxy aleatorio
+        return random.choice(proxies)
+
+    def _update_proxy_stats(self, proxy_addr: str, success: bool):
+        """Actualizar estadísticas de éxito de proxies"""
+        if not hasattr(self, 'proxy_success_rates'):
+            self.proxy_success_rates = {}
+            self.proxy_attempt_counts = {}
+        
+        if proxy_addr not in self.proxy_success_rates:
+            self.proxy_success_rates[proxy_addr] = 0.5
+            self.proxy_attempt_counts[proxy_addr] = 0
+        
+        # Actualizar con promedio móvil
+        current_rate = self.proxy_success_rates[proxy_addr]
+        attempts = self.proxy_attempt_counts[proxy_addr]
+        
+        # Peso decreciente para intentos antiguos
+        weight = min(1.0, 1.0 / (attempts + 1))
+        new_rate = current_rate * (1 - weight) + (1.0 if success else 0.0) * weight
+        
+        self.proxy_success_rates[proxy_addr] = new_rate
+        self.proxy_attempt_counts[proxy_addr] = attempts + 1
     
     def FetchContent(self, request, context):
         """Implementación del método FetchContent"""

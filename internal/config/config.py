@@ -1,23 +1,28 @@
 """
-Configuración general del sistema
+Configuración optimizada para validación rápida de proxies
 """
 
-# Tamaño del chunk de proxies para procesamiento
-DEFAULT_CHUNK_SIZE = 20
+# Tamaño de chunk más pequeño para mejor paralelización
+DEFAULT_CHUNK_SIZE = 10
 
-# Timeout por defecto para sesiones (en milisegundos)
-DEFAULT_SESSION_TIMEOUT = 2000
+# Timeout reducido para validación rápida (en milisegundos)
+DEFAULT_SESSION_TIMEOUT = 1500
+VALIDATION_TIMEOUT = 800  # Timeout específico para validación
 
-# Tiempo de actualización de proxies (en minutos)
-UPDATE_TIME_MINUTES = 30
+# Tiempo de actualización más frecuente
+UPDATE_TIME_MINUTES = 15
 
-# Configuración de Selenium
-SELENIUM_TIMEOUT = 10  # segundos
-SELENIUM_RETRIES = 3
+# Configuración de Selenium optimizada
+SELENIUM_TIMEOUT = 3  # Reducido de 10 a 3 segundos
+SELENIUM_RETRIES = 1  # Reducido de 3 a 1
 
-# User agents por defecto
+# Pool de drivers optimizado
+MAX_VALIDATION_DRIVERS = 25  # Aumentado para mayor concurrencia
+MAX_CONCURRENT_TESTS = 15    # Más tests concurrentes
+MAX_CHUNK_WORKERS = 8        # Más workers por chunk
+
+# User agents optimizados (solo desktop rápidos)
 DEFAULT_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
 ]
