@@ -1,10 +1,11 @@
 """
-Punto de entrada principal del proxy server
+Punto de entrada principal del proxy server con pool de drivers
 """
-import asyncio
 import logging
 import threading
 import time
+import signal
+import sys
 from api.server import start_grpc_server
 from internal.proxy.proxy import ProxyValidator
 from internal.config.config import UPDATE_TIME_MINUTES
@@ -16,9 +17,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Variable global para el servidor
+current_servicer = None
+
+def signal_handler(signum, frame):
+    """Manejo de señales para cierre limpio"""
+    logger.info("Señal de cierre recibida. Cerrando pools de drivers...")
+    if current_servicer:
+        current_servicer.close_pools()
+    sys.exit(0)
+
 def reload_proxies_background():
     """Función para recargar proxies en segundo plano"""
-    proxy_validator = ProxyValidator()
+    proxy_validator = ProxyValidator(max_drivers=5)  # Menos drivers para background
     
     while True:
         try:
@@ -30,15 +41,54 @@ def reload_proxies_background():
             
             logger.info(f"Proxies válidos refrescados: {total_proxies}")
             
+            # Mostrar estadísticas del pool
+            pool_stats = proxy_validator.get_driver_pool_stats()
+            logger.info(f"Estadísticas del pool de validación: {pool_stats}")
+            
         except Exception as e:
             logger.error(f"Error recargando proxies: {e}")
+        finally:
+            # Cerrar pool de validación para liberar recursos
+            proxy_validator.close_driver_pool()
+
+def start_grpc_server_wrapper():
+    """Wrapper para el servidor gRPC que permite acceso al servicer"""
+    global current_servicer
+    
+    logger.info("Iniciando servidor gRPC en puerto 5000")
+    
+    from api.server import ProxyServicer
+    import proxy_pb2_grpc
+    import grpc
+    from concurrent import futures
+    
+    current_servicer = ProxyServicer(max_drivers=10)
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
+    proxy_pb2_grpc.add_ProxyServiceServicer_to_server(current_servicer, server)
+    
+    listen_addr = '[::]:5000'
+    server.add_insecure_port(listen_addr)
+    
+    server.start()
+    logger.info(f"Servidor gRPC iniciado en {listen_addr}")
+    
+    try:
+        server.wait_for_termination()
+    except KeyboardInterrupt:
+        logger.info("Cerrando servidor gRPC...")
+        current_servicer.close_pools()
+        server.stop(0)
 
 def main():
     """Función principal"""
-    logger.info("Iniciando Proxy Server Python con Selenium")
+    logger.info("Iniciando Proxy Server Python con Pool de Drivers")
+    
+    # Configurar manejo de señales
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     
     # Iniciar el servidor gRPC en un hilo separado
-    grpc_thread = threading.Thread(target=start_grpc_server, daemon=True)
+    grpc_thread = threading.Thread(target=start_grpc_server_wrapper, daemon=True)
     grpc_thread.start()
     
     # Iniciar la recarga de proxies en segundo plano
@@ -51,6 +101,8 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         logger.info("Cerrando servidor...")
+        if current_servicer:
+            current_servicer.close_pools()
 
 if __name__ == "__main__":
     main()

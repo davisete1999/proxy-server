@@ -1,5 +1,5 @@
 """
-Servidor gRPC para el proxy service
+Servidor gRPC para el proxy service con pool de drivers
 """
 import grpc
 from concurrent import futures
@@ -7,26 +7,24 @@ import logging
 import random
 import requests
 import time
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
-from webdriver_manager.chrome import ChromeDriverManager
 
 import proxy_pb2
 import proxy_pb2_grpc
 from internal.config.sessions import PROXY_SESSIONS
 from internal.proxy.proxy import ProxyValidator
+from internal.proxy.driver_pool import DriverPool
 from internal.scraper.scraper import scrape_user_agents
 
 logger = logging.getLogger(__name__)
 
 class ProxyServicer(proxy_pb2_grpc.ProxyServiceServicer):
-    def __init__(self):
-        self.proxy_validator = ProxyValidator()
+    def __init__(self, max_drivers: int = 10):
+        self.proxy_validator = ProxyValidator(max_drivers=max_drivers)
+        self.driver_pool = DriverPool(max_drivers=max_drivers)
         self.valid_proxies = {}
         self.successful_proxies = {}
         self.user_agents = []
@@ -39,59 +37,43 @@ class ProxyServicer(proxy_pb2_grpc.ProxyServiceServicer):
         self.user_agents = scrape_user_agents()
         logger.info(f"Servidor inicializado con {len(self.user_agents)} user agents")
     
-    def _get_chrome_options(self, proxy_addr=None):
-        """Configurar opciones de Chrome con proxy opcional"""
-        options = Options()
-        options.add_argument('--headless')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-gpu')
-        options.add_argument('--window-size=1920,1080')
-        
-        if proxy_addr:
-            options.add_argument(f'--proxy-server=http://{proxy_addr}')
-        
-        return options
-    
-    def _create_driver(self, proxy_addr=None, timeout=10):
-        """Crear driver de Selenium con configuración específica"""
-        options = self._get_chrome_options(proxy_addr)
-        
-        try:
-            service = Service(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=options)
-            driver.set_page_load_timeout(timeout)
-            return driver
-        except Exception as e:
-            logger.error(f"Error creando driver: {e}")
-            return None
-    
     def _fetch_with_selenium(self, url, session_name, proxy_addr=None, user_agent=None):
-        """Obtener contenido usando Selenium"""
+        """Obtener contenido usando Selenium con pool de drivers"""
         session_config = PROXY_SESSIONS.get(session_name)
         if not session_config:
             raise ValueError(f"Sesión '{session_name}' no encontrada")
         
         timeout = session_config.timeout / 1000  # Convertir a segundos
-        driver = None
+        driver_instance = None
+        had_error = False
         
         try:
-            driver = self._create_driver(proxy_addr, timeout)
-            if not driver:
-                raise Exception("No se pudo crear el driver")
+            # Obtener driver del pool
+            driver_instance = self.driver_pool.get_driver(proxy_addr)
+            if not driver_instance:
+                raise Exception("No se pudo obtener driver del pool")
+            
+            driver = driver_instance.driver
             
             # Configurar user agent si se proporciona
             if user_agent:
-                driver.execute_cdp_cmd('Network.setUserAgentOverride', {
-                    "userAgent": user_agent
-                })
-            
-            # Configurar headers adicionales
-            if session_config.headers:
-                for header, value in session_config.headers.items():
-                    driver.execute_cdp_cmd('Network.setRequestInterception', {
-                        'patterns': [{'urlPattern': '*'}]
+                try:
+                    driver.execute_cdp_cmd('Network.setUserAgentOverride', {
+                        "userAgent": user_agent
                     })
+                except Exception as e:
+                    logger.debug(f"No se pudo configurar user agent: {e}")
+            
+            # Configurar headers adicionales si es posible
+            if session_config.headers:
+                try:
+                    for header, value in session_config.headers.items():
+                        if header.lower() != 'user-agent':  # Ya configurado arriba
+                            driver.execute_cdp_cmd('Network.setRequestInterception', {
+                                'patterns': [{'urlPattern': '*'}]
+                            })
+                except Exception as e:
+                    logger.debug(f"No se pudieron configurar headers: {e}")
             
             # Navegar a la URL
             driver.get(url)
@@ -105,24 +87,25 @@ class ProxyServicer(proxy_pb2_grpc.ProxyServiceServicer):
             content = driver.page_source.encode('utf-8')
             
             if proxy_addr:
-                logger.info(f"Selenium - Proxy: {proxy_addr}, URL: {url}, Content length: {len(content)}")
+                logger.info(f"Selenium Pool - Proxy: {proxy_addr}, URL: {url}, Content length: {len(content)}")
             else:
-                logger.info(f"Selenium - Direct, URL: {url}, Content length: {len(content)}")
+                logger.info(f"Selenium Pool - Direct, URL: {url}, Content length: {len(content)}")
             
             return content
             
         except TimeoutException:
+            had_error = True
             raise Exception("Timeout esperando a que cargue la página")
         except WebDriverException as e:
+            had_error = True
             raise Exception(f"Error de WebDriver: {str(e)}")
         except Exception as e:
+            had_error = True
             raise Exception(f"Error en Selenium: {str(e)}")
         finally:
-            if driver:
-                try:
-                    driver.quit()
-                except:
-                    pass
+            if driver_instance:
+                # Devolver driver al pool
+                self.driver_pool.return_driver(driver_instance, had_error)
     
     def _fetch_with_requests(self, url, session_name, proxy_addr=None, user_agent=None):
         """Obtener contenido usando requests como fallback"""
@@ -269,6 +252,10 @@ class ProxyServicer(proxy_pb2_grpc.ProxyServiceServicer):
                 stats[session] = count
                 total_proxies += count
             
+            # Agregar estadísticas del pool de drivers
+            pool_stats = self.driver_pool.get_stats()
+            logger.info(f"Driver pool stats: {pool_stats}")
+            
             return proxy_pb2.StatsResponse(
                 proxy_count_by_session=stats,
                 total_valid_proxies=total_proxies
@@ -279,13 +266,20 @@ class ProxyServicer(proxy_pb2_grpc.ProxyServiceServicer):
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
             return proxy_pb2.StatsResponse()
+    
+    def close_pools(self):
+        """Cerrar todos los pools de drivers"""
+        logger.info("Cerrando pools de drivers...")
+        self.driver_pool.close_all()
+        self.proxy_validator.close_driver_pool()
 
 def start_grpc_server():
     """Iniciar el servidor gRPC"""
     logger.info("Iniciando servidor gRPC en puerto 5000")
     
+    servicer = ProxyServicer(max_drivers=10)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    proxy_pb2_grpc.add_ProxyServiceServicer_to_server(ProxyServicer(), server)
+    proxy_pb2_grpc.add_ProxyServiceServicer_to_server(servicer, server)
     
     listen_addr = '[::]:5000'
     server.add_insecure_port(listen_addr)
@@ -297,4 +291,5 @@ def start_grpc_server():
         server.wait_for_termination()
     except KeyboardInterrupt:
         logger.info("Cerrando servidor gRPC...")
+        servicer.close_pools()
         server.stop(0)
