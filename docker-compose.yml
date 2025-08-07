@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  api:
+    build: .
+    container_name: proxy_server
+    ports:
+      - "5000:5000"
+    restart: always
+    networks:
+      - proxy_network
+
+networks:
+  proxy_network:
+    driver: bridge
+    name: proxy_network
+    

@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package fetch;
+
+option go_package = "proxy-api/fetch"; // Este es el paquete Go
+
+// El servicio que definiremos
+service ProxyService {
+    rpc FetchContent(Request) returns (Response);
+}
+
+message Request {
+    string url = 1;
+    string session = 2;
+    bool proxy = 3;
+    bool redirect = 4;
+}
+
+message Response {
+    bytes content = 1;
+}

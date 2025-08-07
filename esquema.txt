@@ -1,0 +1,1052 @@
+=== Estructura de directorios y archivos ===
+├── Dockerfile
+├── README.md
+├── go.mod
+├── api
+│   ├── server.go
+├── docker-compose.yml
+├── script.sh
+├── client
+│   ├── main.go
+├── go.sum
+├── internal
+│   ├── proxy
+│   │   ├── proxy.go
+│   ├── scraper
+│   │   ├── scraper.go
+│   │   ├── scraper_test.go
+│   ├── config
+│   │   ├── config.go
+│   │   ├── sessions.go
+├── test.py
+├── cmd
+│   ├── main.go
+
+=== Contenido de archivos ===
+----- [Archivo: api/server.go] -----
+// api/server.go
+package api
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"math/rand"
+	"net"
+	"net/http"
+	"net/url"
+	pb "proxy-api/fetch"
+	"proxy-api/internal/config"
+	"proxy-api/internal/proxy"
+	"proxy-api/internal/scraper"
+	"strings"
+	"sync"
+	"time"
+
+	"google.golang.org/grpc"
+)
+
+var (
+	validProxies map[string][]string
+	userAgents   []string
+)
+
+type server struct {
+	pb.UnimplementedProxyServiceServer
+	successfulProxies map[string]*http.Client
+	mtx               sync.RWMutex
+}
+
+var errorMap = map[string]struct{}{
+	"context deadline exceeded (Client.Timeout or context cancellation while reading body)": {},
+	"EOF":                       {},
+	"read tcp":                  {},
+	"connection":                {},
+	"Timeout":                   {},
+	"Forbidden":                 {},
+	"(Client.Timeout":           {},
+	"Internal Server Error":     {},
+	"Bad Gateway":               {},
+	"Service Unavailable":       {},
+	"Gateway Timeout":           {},
+	"Too many open connections": {},
+	"unconfigured cipher suite": {},
+	"ClientConn.Close":          {},
+	"GOAWAY":                    {},
+	"proxyconnect tcp:":         {},
+	"Temporary Redirect":        {},
+	"Internal Privoxy Error":    {},
+	"certificate":               {},
+	"bad record MAC":            {},
+	"lookup":                    {},
+}
+
+func isTimeoutError(err error) bool {
+	if urlErr, ok := err.(*url.Error); ok && urlErr.Timeout() {
+		return true
+	}
+
+	for errMsg := range errorMap {
+		if strings.Contains(err.Error(), errMsg) || err.Error() == errMsg {
+			return true
+		}
+	}
+
+	return false
+}
+
+var nilMap = map[string]struct{}{
+	"<strong>Error:</strong>": {},
+	"Marshal":                 {},
+	"error while marshaling: proto: Marshal called with nilh": {},
+	"Servicio no": {},
+	"GOAWAY":      {},
+	`http2: server sent GOAWAY and closed the connection;`:                      {},
+	`{"code":110,"message":"Sport API error","name":"ServiceUnavailableError"}`: {},
+	"http2:":          {},
+	"temporary error": {},
+}
+
+func IsNilContent(content string) bool {
+	for errMsg := range nilMap {
+		if strings.Contains(content, errMsg) || content == errMsg {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (s *server) getHTTPClient(proxyAddr string, redirect bool, session string) (*http.Client, error) {
+	s.mtx.RLock()
+	client, ok := s.successfulProxies[proxyAddr]
+	s.mtx.RUnlock()
+
+	if ok {
+		return client, nil
+	}
+
+	if proxyAddr == "default" {
+		return http.DefaultClient, nil
+	}
+
+	proxyURL, _ := url.Parse(proxyAddr)
+	client = &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		},
+		Timeout: time.Duration(config.ProxySessions[session].Timeout) * time.Millisecond,
+	}
+
+	if !redirect {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	} else {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return nil
+		}
+	}
+
+	s.mtx.Lock()
+	s.successfulProxies[proxyAddr] = client
+	s.mtx.Unlock()
+
+	return client, nil
+}
+
+func (s *server) removeSuccesfulProxy(proxyAddr string) {
+	s.mtx.Lock()
+	delete(s.successfulProxies, proxyAddr)
+	s.mtx.Unlock()
+}
+
+// WITHOUT PROXIES
+func (s *server) Fetch(ctx context.Context, req *pb.Request, userAgent string, redirect bool) (*pb.Response, error) {
+	client, err := s.getHTTPClient("default", redirect, req.Session)
+	if err != nil {
+		return nil, err
+	}
+
+	reqObj, err := http.NewRequestWithContext(ctx, "GET", req.Url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	reqObj.Header.Set("User-Agent", userAgent)
+	for k, v := range config.GetHeadersFromSession(req.Session) {
+		reqObj.Header.Set(k, v)
+	}
+
+	resp, err := client.Do(reqObj)
+	if err != nil {
+		// Retry if there is a timeout error.
+		if ctx.Err() == context.DeadlineExceeded || isTimeoutError(err) {
+			log.Println("Retry due to", err)
+			return s.Fetch(ctx, req, userAgent, redirect)
+		}
+
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Printf("User-Agent: %s, Status: %d, URL: %s\n", userAgent, resp.StatusCode, req.Url)
+	return &pb.Response{Content: bodyBytes}, nil
+}
+
+func (s *server) useProxyToFetch(ctx context.Context, req *pb.Request, proxyAddr string, userAgent string, redirect bool, contentChan chan []byte, errorChan chan error) {
+	client, err := s.getHTTPClient(proxyAddr, redirect, req.Session)
+	if err != nil {
+		errorChan <- err
+		return
+	}
+
+	reqObj, err := http.NewRequestWithContext(ctx, "GET", req.Url, nil)
+	if err != nil {
+		errorChan <- err
+		return
+	}
+
+	reqObj.Header.Set("User-Agent", userAgent)
+	for k, v := range config.GetHeadersFromSession(req.Session) {
+		reqObj.Header.Set(k, v)
+	}
+
+	resp, err := client.Do(reqObj)
+	if err != nil {
+		s.removeSuccesfulProxy(proxyAddr) // remove the proxy from successfulProxies
+		errorChan <- err
+		return
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		errorChan <- err
+		return
+	}
+
+	log.Printf("Proxy: %s, User-Agent: %s, Status: %d, URL: %s", proxyAddr, userAgent, resp.StatusCode, req.Url)
+	contentChan <- bodyBytes
+}
+
+func (s *server) FetchContent(ctx context.Context, req *pb.Request) (*pb.Response, error) {
+	if req.Session == "" || validProxies[req.Session] == nil {
+		return nil, fmt.Errorf("invalid session")
+	}
+
+	var redirect bool
+	if req.Redirect {
+		redirect = req.Redirect
+	} else {
+		redirect = false
+	}
+
+	selectedUserAgent := userAgents[rand.Intn(len(userAgents))]
+
+	if req.Proxy {
+		contentChan := make(chan []byte)
+		errorChan := make(chan error)
+
+		// Primero se utilizan los successfulProxies
+		s.mtx.RLock()
+		for proxyAddr := range s.successfulProxies {
+			go s.useProxyToFetch(ctx, req, "http://"+proxyAddr, selectedUserAgent, redirect, contentChan, errorChan)
+		}
+		s.mtx.RUnlock()
+
+		// Si falla, utiliza los validProxies
+		if len(contentChan) == 0 {
+			for _, proxyAddr := range validProxies[req.Session] {
+				go s.useProxyToFetch(ctx, req, "http://"+proxyAddr, selectedUserAgent, redirect, contentChan, errorChan)
+			}
+		}
+
+		for range validProxies[req.Session] {
+			select {
+			case content := <-contentChan:
+				return &pb.Response{Content: content}, nil
+			case <-errorChan:
+				continue
+			}
+		}
+
+		return s.Fetch(ctx, req, selectedUserAgent, redirect)
+	}
+
+	return s.Fetch(ctx, req, selectedUserAgent, redirect)
+}
+
+func UpdateValidProxies(proxies map[string][]string) {
+	validProxies = proxies
+}
+
+func StartGRPCServer() {
+	validProxies = proxy.GetValidProxies()
+	userAgents = scraper.ScrapeUserAgents()
+
+	log.Println("Iniciando servidor gRPC")
+	lis, err := net.Listen("tcp", ":5000")
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
+	}
+
+	maxSize := 5 * 1024 * 1024
+	grpcServer := grpc.NewServer(
+		grpc.MaxRecvMsgSize(maxSize), // Tamaño máximo de mensaje recibido.
+		grpc.MaxSendMsgSize(maxSize), // Tamaño máximo de mensaje enviado.
+	)
+	pb.RegisterProxyServiceServer(grpcServer, &server{successfulProxies: make(map[string]*http.Client)})
+	if err := grpcServer.Serve(lis); err != nil {
+		log.Fatalf("failed to serve: %v", err)
+	}
+
+}
+
+----- [Archivo: client/main.go] -----
+package main
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"fmt"
+	"io"
+	"log"
+	fetch "proxy-api/fetch"
+	"sync"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+)
+
+func createClient() (fetch.ProxyServiceClient, *grpc.ClientConn) {
+	conn, err := grpc.Dial(":5000", grpc.WithTransportCredentials(insecure.NewCredentials())) // Conexión sin cifrado para propósitos de ejemplo
+	if err != nil {
+		log.Fatalf("Did not connect: %s", err)
+	}
+	return fetch.NewProxyServiceClient(conn), conn
+}
+
+func DecompressAndConvertToString(data []byte) (string, error) {
+	reader, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	defer reader.Close()
+
+	decompressedData, err := io.ReadAll(reader)
+	if err != nil {
+		return "", err
+	}
+
+	return string(decompressedData), nil
+}
+
+func main() {
+
+	const numRequests = 500
+	var wg sync.WaitGroup
+	wg.Add(numRequests)
+
+	successfulRequests := 0
+	mutex := &sync.Mutex{}
+
+	startTime := time.Now()
+
+	client, conn := createClient() // Crear un nuevo cliente para cada solicitud
+
+	defer conn.Close()
+	fmt.Println("e")
+	for i := 0; i < numRequests; i++ {
+		go func() {
+			defer wg.Done()
+
+			//var retries int
+
+			var response *fetch.Response
+			var err error
+
+			//for {
+			//response, err = client.FetchContent(context.Background(), &fetch.Request{
+			//	Url:      "https://translate.googleapis.com/translate_a/single?client=gtx&sl=es&tl=en&dt=q&q=Hello",
+			//	Session:  "GoogleTranslate",
+			//	Proxy:    true,
+			//	Redirect: false,
+			//})
+			response, err = client.FetchContent(context.Background(), &fetch.Request{
+				Url:      "https://local-global.flashscore.ninja/2/x/feed/r_1_1",
+				Session:  "FlashScore",
+				Proxy:    false,
+				Redirect: false,
+			})
+
+			/*html, err := DecompressAndConvertToString(response.Content)
+			if err != nil {
+				fmt.Printf("Error: %s\n", err)
+			}*/
+
+			if err == nil && response != nil {
+				fmt.Println(response.Content)
+				mutex.Lock()
+				successfulRequests++
+				mutex.Unlock()
+			} else {
+				fmt.Printf("Error: %s\n", err)
+			}
+		}()
+	}
+
+	wg.Wait()
+	elapsedTime := time.Since(startTime)
+
+	fmt.Printf("Total time for %d requests: %s\n", numRequests, elapsedTime)
+	fmt.Printf("Successful requests: %d\n", successfulRequests)
+	fmt.Printf("Failed requests: %d\n", numRequests-successfulRequests)
+}
+
+----- [Archivo: cmd/main.go] -----
+package main
+
+import (
+	"fmt"
+	"proxy-api/api"
+	"proxy-api/internal/config"
+	"proxy-api/internal/proxy"
+	"time"
+)
+
+func main() {
+	// Iniciar el servidor gRPC
+	go api.StartGRPCServer()
+
+	// Refrescar proxies al inicio
+	go reloadProxiesInBackground()
+
+	// Mantener la aplicación en ejecución
+	select {}
+}
+
+func reloadProxiesInBackground() {
+	for {
+		time.Sleep(config.UpdateTime * time.Minute)
+
+		newProxyMap := proxy.GetValidProxies()
+		fmt.Printf("Proxies válidos refrescados: %d\n", len(newProxyMap))
+
+		// Update the valid proxies in the server
+		api.UpdateValidProxies(newProxyMap)
+	}
+}
+
+----- [Archivo: docker-compose.yml] -----
+version: "3.8"
+
+services:
+  api:
+    build: .
+    container_name: proxy_server
+    ports:
+      - "5000:5000"
+    restart: always
+    networks:
+      - proxy_network
+
+networks:
+  proxy_network:
+    driver: bridge
+    name: proxy_network
+    
+----- [Archivo: Dockerfile] -----
+# Usa una imagen de Go como base
+FROM golang AS builder
+
+# Configura las variables de entorno
+ENV GO111MODULE=on \
+    CGO_ENABLED=0 \
+    GOOS=linux \
+    GOARCH=amd64
+
+# Crea un directorio de trabajo dentro del contenedor
+WORKDIR /build
+
+# Copia los archivos del proyecto al directorio de trabajo
+COPY . .
+
+# Compila la aplicación
+RUN go build -o main ./cmd/main.go
+
+# Empieza a construir la imagen final
+FROM alpine:latest
+
+# Instala las dependencias necesarias
+RUN apk --no-cache add ca-certificates
+
+# Copia el binario compilado desde la etapa anterior
+COPY --from=builder /build/main /app/main
+
+# Establece el directorio de trabajo
+WORKDIR /app
+
+# Expone el puerto en el que la aplicación escucha
+EXPOSE 5000
+
+# Ejecuta la aplicación cuando el contenedor se inicia
+CMD ["./main"]
+----- [Archivo: go.mod] -----
+module proxy-api
+
+go 1.18
+
+require (
+	google.golang.org/grpc v1.59.0
+	google.golang.org/protobuf v1.31.0
+)
+
+require (
+	github.com/golang/protobuf v1.5.3 // indirect
+	golang.org/x/net v0.15.0 // indirect
+	golang.org/x/sys v0.12.0 // indirect
+	golang.org/x/text v0.13.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20230822172742-b8732ec3820d // indirect
+)
+
+----- [Archivo: go.sum] -----
+github.com/golang/protobuf v1.5.0/go.mod h1:FsONVRAS9T7sI+LIUmWTfcYkHO4aIWwzhcaSAoJOfIk=
+github.com/golang/protobuf v1.5.3 h1:KhyjKVUg7Usr/dYsdSqoFveMYd5ko72D+zANwlG1mmg=
+github.com/golang/protobuf v1.5.3/go.mod h1:XVQd3VNwM+JqD3oG2Ue2ip4fOMUkwXdXDdiuN0vRsmY=
+github.com/google/go-cmp v0.5.5/go.mod h1:v8dTdLbMG2kIc/vJvl+f65V22dbkXbowE6jgT/gNBxE=
+github.com/google/go-cmp v0.5.9 h1:O2Tfq5qg4qc4AmwVlvv0oLiVAGB7enBSJ2x2DqQFi38=
+golang.org/x/net v0.15.0 h1:ugBLEUaxABaB5AJqW9enI0ACdci2RUd4eP51NTBvuJ8=
+golang.org/x/net v0.15.0/go.mod h1:idbUs1IY1+zTqbi8yxTbhexhEEk5ur9LInksu6HrEpk=
+golang.org/x/sys v0.12.0 h1:CM0HF96J0hcLAwsHPJZjfdNzs0gftsLfgKt57wWHJ0o=
+golang.org/x/sys v0.12.0/go.mod h1:oPkhp1MJrh7nUepCBck5+mAzfO9JrbApNNgaTdGDITg=
+golang.org/x/text v0.13.0 h1:ablQoSUd0tRdKxZewP80B+BaqeKJuVhuRxj/dkrun3k=
+golang.org/x/text v0.13.0/go.mod h1:TvPlkZtksWOMsz7fbANvkp4WM8x/WCo/om8BMLbz+aE=
+golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543/go.mod h1:I/5z698sn9Ka8TeJc9MKroUUfqBBauWjQqLJ2OPfmY0=
+google.golang.org/genproto/googleapis/rpc v0.0.0-20230822172742-b8732ec3820d h1:uvYuEyMHKNt+lT4K3bN6fGswmK8qSvcreM3BwjDh+y4=
+google.golang.org/genproto/googleapis/rpc v0.0.0-20230822172742-b8732ec3820d/go.mod h1:+Bk1OCOj40wS2hwAMA+aCW9ypzm63QTBBHp6lQ3p+9M=
+google.golang.org/grpc v1.59.0 h1:Z5Iec2pjwb+LEOqzpB2MR12/eKFhDPhuqW91O+4bwUk=
+google.golang.org/grpc v1.59.0/go.mod h1:aUPDwccQo6OTjy7Hct4AfBPD1GptF4fyUjIkQ9YtF98=
+google.golang.org/protobuf v1.26.0-rc.1/go.mod h1:jlhhOSvTdKEhbULTjvd4ARK9grFBp09yW+WbY/TyQbw=
+google.golang.org/protobuf v1.26.0/go.mod h1:9q0QmTI4eRPtz6boOQmLYwt+qCgq0jsYwAQnmE0givc=
+google.golang.org/protobuf v1.31.0 h1:g0LDEJHgrBl9N9r17Ru3sqWhkIx2NB67okBHPwC7hs8=
+google.golang.org/protobuf v1.31.0/go.mod h1:HV8QOd/L58Z+nl8r43ehVNZIU/HEI6OcFqwMG9pJV4I=
+
+----- [Archivo: internal/config/config.go] -----
+package config
+
+// Tamaño del chunk de proxies
+const DefaultChunkSize = 20
+const DefaultSessionTimeout = 1000 //ms
+const UpdateTime = 30
+
+----- [Archivo: internal/config/sessions.go] -----
+package config
+
+type ProxySession struct {
+	Name    string
+	URL     string
+	Headers map[string]string
+	Timeout int
+}
+
+var ProxySessions = map[string]ProxySession{
+	/*"FlashScore": {
+		Name: "FlashScore",
+		URL:  "https://local-global.flashscore.ninja/2/x/feed/r_1_1",
+		Headers: map[string]string{
+			"Accept-Encoding":    "gzip, deflate, br",
+			"Accept-Language":    "es-ES,es;q=0.9,en;q=0.8,zh-TW;q=0.7,zh;q=0.6,ja;q=0.5,zh-CN;q=0.4",
+			"Origin":             "https://www.flashscore.es",
+			"Referer":            "https://www.flashscore.es/",
+			"Sec-Ch-Ua":          "'Google Chrome';v='117', 'Not;A=Brand';v='8', 'Chromium';v='117'",
+			"Sec-Ch-Ua-Mobile":   "?0",
+			"Sec-Ch-Ua-Platform": "'Windows'",
+			"Sec-Fetch-Dest":     "empty",
+			"Sec-Fetch-Mode":     "cors",
+			"Sec-Fetch-Site":     "cross-site",
+			"X-Fsign":            "SW9D1eZo",
+		},
+		Timeout: DefaultSessionTimeout,
+	}, */
+	"GoogleTranslateAPI": {
+		Name:    "GoogleTranslateAPI",
+		URL:     "https://translate.googleapis.com/translate_a/single?client=gtx&sl=es&tl=en&dt=q&q=Hello",
+		Headers: map[string]string{},
+		Timeout: DefaultSessionTimeout,
+	},
+	"GoogleTranslateClient": {
+		Name:    "GoogleTranslateClient",
+		URL:     "https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=es&tl=en&q=Hello",
+		Headers: map[string]string{},
+		Timeout: DefaultSessionTimeout,
+	},
+}
+
+func GetHeadersFromSession(session string) map[string]string {
+	return ProxySessions[session].Headers
+}
+
+----- [Archivo: internal/proxy/proxy.go] -----
+package proxy
+
+import (
+	"log"
+	"net/http"
+	"net/url"
+	"proxy-api/internal/config"
+	"proxy-api/internal/scraper"
+	"sync"
+	"time"
+)
+
+// Tamaño del chunk, idealmente esto debería venir de un archivo de configuración
+const ChunkSize = config.DefaultChunkSize
+
+// ValidProxies almacena los proxies válidos, con locking para acceso seguro
+var (
+	ValidProxies = make(map[string][]string)
+	mutex        = &sync.Mutex{}
+)
+
+// Procesar un solo test de proxy
+func RunProxyTest(cfg config.ProxySession, proxy string) {
+	proxyURL, err := url.Parse("http://" + proxy)
+	if err != nil {
+		log.Printf("Error al parsear el proxy %s: %v", proxy, err)
+		return
+	}
+
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		},
+		Timeout: time.Duration(cfg.Timeout) * time.Millisecond,
+	}
+
+	request, err := http.NewRequest("GET", cfg.URL, nil)
+	if err != nil {
+		log.Printf("Error al crear la solicitud: %v", err)
+		return
+	}
+
+	for headerName, headerValue := range cfg.Headers {
+		request.Header.Set(headerName, headerValue)
+	}
+
+	request.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36")
+
+	resp, err := httpClient.Do(request)
+	if err != nil || (resp != nil && resp.StatusCode != 200) {
+		log.Printf("Proxy %s no válido para %s", proxy, cfg.Name)
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return
+	}
+
+	mutex.Lock()
+	ValidProxies[cfg.Name] = append(ValidProxies[cfg.Name], proxy)
+	mutex.Unlock()
+
+	if resp != nil {
+		resp.Body.Close()
+	}
+}
+
+// Procesar todos los tests en un proxy
+func runAllTests(proxy string) {
+	var wg sync.WaitGroup
+	wg.Add(len(config.ProxySessions))
+
+	for _, test := range config.ProxySessions {
+		go func(test config.ProxySession) {
+			defer wg.Done()
+			RunProxyTest(test, proxy)
+		}(test)
+	}
+
+	wg.Wait()
+}
+
+// Divide los proxies en chunks más manejables
+func chunkProxies(proxies []string) [][]string {
+	var chunks [][]string
+	for i := 0; i < len(proxies); i += ChunkSize {
+		end := i + ChunkSize
+		if end > len(proxies) {
+			end = len(proxies)
+		}
+		chunks = append(chunks, proxies[i:end])
+	}
+	return chunks
+}
+
+// ValidateProxies realiza la validación de la lista de proxies
+func GetValidProxies() map[string][]string {
+	proxies := scraper.ScrapeProxies()
+	chunks := chunkProxies(proxies)
+	var wg sync.WaitGroup
+	var progressMutex sync.Mutex
+	chunksProcessed := 0
+
+	for _, chunk := range chunks {
+		wg.Add(1)
+		go func(chunk []string) {
+			defer wg.Done()
+			for _, proxy := range chunk {
+				runAllTests(proxy)
+			}
+
+			progressMutex.Lock()
+			chunksProcessed++
+			log.Printf("Progreso: %d/%d chunks procesados.", chunksProcessed, len(chunks))
+			progressMutex.Unlock()
+
+		}(chunk)
+	}
+
+	wg.Wait()
+
+	mutex.Lock()
+	defer mutex.Unlock()
+	for site, proxies := range ValidProxies {
+		log.Printf("Sitio web: %s | Proxies: %v", site, len(proxies))
+	}
+
+	return ValidProxies
+}
+
+----- [Archivo: internal/scraper/scraper.go] -----
+package scraper
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+)
+
+type Scraper struct {
+	urls     []string
+	dataType string
+}
+
+func NewScraper(urls []string, dataType string) *Scraper {
+	return &Scraper{
+		urls:     urls,
+		dataType: dataType,
+	}
+}
+
+func (s *Scraper) Scrape(ctx context.Context) []string {
+	resultChan := make(chan []string)
+	errChan := make(chan error)
+
+	for _, url := range s.urls {
+		go s.fetchData(ctx, url, resultChan, errChan)
+	}
+
+	timeout := time.After(25 * time.Second)
+	var results []string
+	for i := 0; i < len(s.urls); i++ {
+		select {
+		case res := <-resultChan:
+			results = append(results, res...)
+		case err := <-errChan:
+			fmt.Printf("Error scraping %s data: %s\n", s.dataType, err)
+		case <-timeout:
+			fmt.Println("Scraping timed out.")
+			return results
+		}
+	}
+	return results
+}
+
+func (s *Scraper) fetchData(ctx context.Context, url string, resultChan chan []string, errChan chan error) {
+	fmt.Printf("Obteniendo %s de %s...\n", s.dataType, url)
+
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
+	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
+	if err != nil {
+		errChan <- err
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		errChan <- err
+		return
+	}
+
+	lines := strings.Split(string(body), "\n")
+	var validLines []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.Count(trimmed, ":") > 1 {
+			trimmed = strings.Split(trimmed, ":")[0] + ":" + strings.Split(trimmed, ":")[1]
+		}
+		if trimmed != "" || (strings.Contains(url, "user-agents") && (!strings.Contains(trimmed, "Android") &&
+			!strings.Contains(trimmed, "iPhone") &&
+			!strings.Contains(trimmed, "iPad") &&
+			!strings.Contains(trimmed, "compatible;"))) {
+
+			validLines = append(validLines, trimmed)
+		}
+	}
+	resultChan <- validLines
+}
+
+func ScrapeProxies() []string {
+	urls := []string{
+		//"https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+		"https://raw.githubusercontent.com/saisuiu/Lionkings-Http-Proxys-Proxies/main/free.txt",
+		"https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt",
+		//"https://raw.githubusercontent.com/zloi-user/hideip.me/main/https.txt",
+		//"https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+		//"https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+		//"https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
+		//"https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt",
+		//"https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/http.txt",
+	}
+	scraper := NewScraper(urls, "proxies")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return scraper.Scrape(ctx)
+}
+
+func ScrapeUserAgents() []string {
+	urls := []string{
+		"https://gist.githubusercontent.com/pzb/b4b6f57144aea7827ae4/raw/cf847b76a142955b1410c8bcef3aabe221a63db1/user-agents.txt",
+	}
+	scraper := NewScraper(urls, "user-agents")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Número máximo de intentos
+	maxRetries := 3
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		result := scraper.Scrape(ctx)
+		if len(result) > 0 {
+			// Si la operación tiene éxito, retornar los datos
+			return result
+		}
+
+		// Si la operación falla, esperar un momento antes de volver a intentar
+		fmt.Printf("Intento %d fallido. Reintentando...\n", attempt)
+		scraper = NewScraper(urls, "user-agents")
+		time.Sleep(2 * time.Second)
+	}
+
+	// Si todos los intentos fallan, retornar una lista vacía o manejar el error de otra manera.
+	return []string{}
+}
+
+----- [Archivo: internal/scraper/scraper_test.go] -----
+package scraper
+
+import (
+	"testing"
+)
+
+func TestScrapeProxies(t *testing.T) {
+	// Usamos una URL de ejemplo que sabemos que debería devolver proxies
+	proxies := ScrapeProxies()
+	userAgents := ScrapeUserAgents()
+
+	if len(proxies) == 0 {
+		t.Errorf("La lista de proxies está vacía")
+	}
+
+	if len(userAgents) == 0 {
+		t.Errorf("La lista de user agents está vacía")
+	}
+}
+
+----- [Archivo: README.md] -----
+# Instrucciones Avanzadas para el Uso del Proyecto Proxy-API
+
+## Montaje de la Imagen Docker en Segundo Plano
+
+Además del uso de `docker-compose`, puedes construir y ejecutar la imagen Docker manualmente.
+
+### Construir la Imagen con Docker Build
+
+1. **Construye la imagen Docker:**
+   ```sh
+   docker build -t proxy-api .
+   ```
+
+   Esto creará una imagen Docker llamada `proxy-api` utilizando el `Dockerfile` presente en el proyecto.
+
+2. **Ejecutar la imagen en segundo plano:**
+   ```sh
+   docker run -d -p 5000:5000 --name proxy_server proxy-api
+   ```
+
+   Este comando ejecutará un contenedor basado en la imagen `proxy-api`, exponiendo el puerto 5000 y ejecutándose en segundo plano.
+
+## Uso de los Archivos Proto en Otros Proyectos
+
+Para generar los archivos necesarios para utilizar el servicio gRPC en otros proyectos:
+
+1. **Ejecuta el script `generateProxyProto.sh`:**
+   ```sh
+   ./generateProxyProto.sh
+   ```
+
+   Esto generará los archivos necesarios en los lenguajes especificados (por ejemplo, Go, Python, etc.) a partir del archivo `proto`.
+
+2. **Importa los archivos generados en tu proyecto cliente:**
+   Utiliza estos archivos en tu proyecto cliente para interactuar con el servicio gRPC del Proxy-API.
+
+## Sesiones y su Uso
+
+Las sesiones en `config.ProxySessions` permiten especificar configuraciones particulares para diferentes destinos web. Cada sesión define un conjunto de encabezados HTTP, una URL y un tiempo de espera. Estas sesiones permiten adaptar las solicitudes a las particularidades de cada recurso web, como diferentes mecanismos de autenticación o requerimientos de encabezados específicos.
+
+### Ejemplo de Sesiones
+
+```go
+var ProxySessions = map[string]ProxySession{
+	"GoogleTranslateAPI": {
+		Name:    "GoogleTranslateAPI",
+		URL:     "https://translate.googleapis.com/translate_a/single...",
+		Headers: map[string]string{},
+		Timeout: DefaultSessionTimeout,
+	},
+	"GoogleTranslateClient": {
+		Name:    "GoogleTranslateClient",
+		URL:     "https://clients5.google.com/translate_a/t...",
+		Headers: map[string]string{},
+		Timeout: DefaultSessionTimeout,
+	},
+}
+```
+
+### Uso en el Servicio gRPC
+
+Al realizar una solicitud a través del servicio `FetchContent` de gRPC, puedes especificar una de estas sesiones. El servidor Proxy-API utilizará la configuración de la sesión elegida para personalizar la solicitud HTTP.
+
+#### Ejemplo de Uso de Sesiones en una Solicitud gRPC
+
+```proto
+message Request {
+    string url = 1; // URL a acceder
+    string session = 2; // Nombre de la sesión a utilizar
+    bool proxy = 3; // Indica si se debe usar un proxy
+    bool redirect = 4; // Permite o impide redirecciones automáticas
+}
+```
+
+En el campo `session`, incluye el nombre de la sesión deseada, como `GoogleTranslateAPI` o `GoogleTranslateClient`. Esto permitirá que el servicio Proxy-API use las configuraciones específicas de esa sesión al realizar la solicitud.
+
+## Conclusión
+
+Con estas instrucciones avanzadas, deberías ser capaz de construir y ejecutar el servicio Proxy-API, tanto directamente como a través de Docker, y utilizar sus capacidades en otros proyectos mediante los archivos generados por `generateProxyProto.sh`. Además, puedes aprovechar las sesiones para realizar solicitudes personalizadas a diferentes servicios web.
+----- [Archivo: script.sh] -----
+#!/usr/bin/env bash
+
+# Nombre del archivo de salida
+OUTPUT="esquema.txt"
+
+# Patrones a excluir (incluye el propio OUTPUT)
+EXCLUDE_PATTERNS=(
+  "$OUTPUT"        # No incluir el archivo de salida
+  ".git"           # Control de versiones
+  "node_modules"   # Dependencias de Node.js
+  ".DS_Store"      # Metadatos en macOS
+  "Thumbs.db"      # Metadatos en Windows
+  "__pycache__"    # Cachés de Python
+  "*.pyc"          # Archivos compilados de Python
+  "*.o"            # Objetos compilados (C/C++)
+  "*.so"           # Librerías compartidas
+  "venv"           # Entorno virtual de Python
+  "dist"           # Carpeta de distribución
+  "fetch"         # Archivos de caché de fetch
+  ".gitignore"    # Ignorar archivos de configuración de git
+)
+
+# 1) Truncar o crear el archivo de salida sin preguntar
+: > "$OUTPUT"
+
+# 2) Construir la expresión de prune para find
+prune_args=()
+for pat in "${EXCLUDE_PATTERNS[@]}"; do
+  prune_args+=( -name "$pat" -o )
+done
+# Eliminar el último '-o'
+unset 'prune_args[${#prune_args[@]}-1]'
+
+# 3) Estructura de directorios y archivos
+echo "=== Estructura de directorios y archivos ===" >> "$OUTPUT"
+find . -mindepth 1 \( "${prune_args[@]}" \) -prune -o -print | \
+  sed \
+    -e 's|[^/]*/|│   |g' \
+    -e 's|│   \([^│]\)|├── \1|' \
+  >> "$OUTPUT"
+echo >> "$OUTPUT"
+
+# 4) Contenido de cada archivo
+echo "=== Contenido de archivos ===" >> "$OUTPUT"
+find . -mindepth 1 \( "${prune_args[@]}" \) -prune -o \( -type f ! -name "$OUTPUT" -print \) | sort | \
+while IFS= read -r file; do
+  rel="${file#./}"
+  echo "----- [Archivo: $rel] -----" >> "$OUTPUT"
+  if [ -r "$file" ] && [ ! -d "$file" ]; then
+    cat "$file" >> "$OUTPUT"
+  else
+    echo "[No se puede leer: $rel]" >> "$OUTPUT"
+  fi
+  echo >> "$OUTPUT"
+done
+
+----- [Archivo: test.py] -----
+import aiohttp
+import asyncio
+import matplotlib.pyplot as plt
+
+URL = "http://192.168.200.9:5000/getContent?session=FlashScore&url=https://local-spanish.flashscore.ninja/13/x/feed/tr_2_5733_6edGepjk_33_0_2_es_1"
+NUM_REQUESTS = 1
+
+async def fetch_content(session):
+    try:
+        async with session.get(URL) as response:
+            if response.status == 200 and await response.text():
+                return True  # Devolvió contenido
+        return False  # No devolvió contenido
+    except:
+        return False  # Error en la petición
+
+async def main():
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_content(session) for _ in range(NUM_REQUESTS)]
+        results = await asyncio.gather(*tasks)
+        successful_requests = sum(1 for result in results if result)
+        unsuccessful_requests = NUM_REQUESTS - successful_requests
+
+        print(f"Peticiones exitosas: {successful_requests}")
+        print(f"Peticiones sin éxito: {unsuccessful_requests}")
+
+        # Representación gráfica
+        labels = ["Exitosas", "Sin éxito"]
+        counts = [successful_requests, unsuccessful_requests]
+        plt.bar(labels, counts, color=['green', 'red'])
+        plt.title("Resultado de 1000 peticiones")
+        plt.ylabel("Número de peticiones")
+        plt.show()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
