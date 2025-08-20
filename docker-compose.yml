@@ -10,9 +10,9 @@ services:
     volumes:
       - /dev/shm:/dev/shm
     networks:
-      - proxy_network
+      - crypto-database_network
+
 
 networks:
-  proxy_network:
-    driver: bridge
-    name: proxy_network
+  crypto-database_network:
+    external: true
